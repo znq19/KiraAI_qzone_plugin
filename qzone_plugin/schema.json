@@ -4,15 +4,10 @@
         "default": "",
         "hint": "QQ空间登录Cookie（可选，若启用自动刷新则不需要手动填写）。获取方法：浏览器登录 qzone.qq.com，按F12打开开发者工具，在Network中找到任意请求，复制Cookie字符串。"
     },
-    "qq_account": {
+    "qq_ada": {
         "type": "string",
         "default": "",
-        "hint": "QQ账号（用于自动登录，可选）"
-    },
-    "qq_password": {
-        "type": "string",
-        "default": "",
-        "hint": "QQ密码（用于自动登录，可选）"
+        "hint": "QQ 适配器名称，不填则自动获取平台类型为 QQ 的适配器"
     },
     "auto_refresh_cookie": {
         "type": "boolean",
@@ -22,7 +17,7 @@
     "master_ids": {
         "type": "string",
         "default": "",
-        "hint": "主人QQ号，多个用英文逗号分隔。只有这些QQ号才能使用QQ空间相关工具（发说说、评论、点赞等）。"
+        "hint": "主人QQ号，多个用英文逗号分隔。只有这些QQ号才能命令AI使用QQ空间操作性工具（发说说、评论、点赞等）。"
     },
     "timeout": {
         "type": "int",
@@ -33,21 +28,6 @@
         "type": "string",
         "default": "data/temp",
         "hint": "临时文件存放目录（用于下载图片）"
-    },
-    "llonebot_host": {
-        "type": "string",
-        "default": "127.0.0.1",
-        "hint": "LLOneBot HTTP服务地址，通常为 127.0.0.1"
-    },
-    "llonebot_port": {
-        "type": "int",
-        "default": 3000,
-        "hint": "LLOneBot HTTP服务端口（与你的 LLOneBot 配置一致）"
-    },
-    "access_token": {
-        "type": "string",
-        "default": "",
-        "hint": "LLOneBot 访问令牌（如果有）"
     },
     "auto_publish_schedule": {
         "type": "string",

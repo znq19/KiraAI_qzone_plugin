@@ -22,15 +22,6 @@ from .qzone.utils import download_file
 from .qzone.parser import QzoneParser
 from .qzone.model import Post as QzonePost, Comment as QzoneComment, ApiResponse
 
-from selenium import webdriver
-from selenium.webdriver.edge.service import Service as EdgeService
-from selenium.webdriver.edge.options import Options as EdgeOptions
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.microsoft import EdgeChromiumDriverManager
-from selenium.common.exceptions import WebDriverException, TimeoutException
-
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -45,7 +36,6 @@ false = False
 
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
-PERSONA_PATH = Path("data/persona.txt")
 MAX_HISTORY = 10
 
 
@@ -75,8 +65,7 @@ class QzonePlugin(BasePlugin):
         super().__init__(ctx, cfg)
         self.cfg = cfg
         self.cookies_str = cfg.get("cookies_str", "")
-        self.qq_account = cfg.get("qq_account", "")
-        self.qq_password = cfg.get("qq_password", "")
+        self.qq_ada = cfg.get("qq_ada", "")
         self.auto_refresh = cfg.get("auto_refresh_cookie", True)
         self.timeout = cfg.get("timeout", 10)
         self.temp_dir = Path(cfg.get("temp_dir", "data/temp"))
@@ -85,12 +74,6 @@ class QzonePlugin(BasePlugin):
         # 主人白名单
         master_ids_str = cfg.get("master_ids", "")
         self.master_ids = [x.strip() for x in master_ids_str.split(",") if x.strip()]
-
-        # llonebot 配置
-        self.llonebot_host = cfg.get("llonebot_host", "127.0.0.1")
-        self.llonebot_port = cfg.get("llonebot_port", 3000)
-        self.access_token = cfg.get("access_token", "")
-        self.llonebot_base = f"http://{self.llonebot_host}:{self.llonebot_port}"
 
         # 解析通用任务目标
         task_group_ids_str = cfg.get("task_group_ids", "")
@@ -140,24 +123,50 @@ class QzonePlugin(BasePlugin):
         # 保活任务标志
         self._keep_alive_task = None
 
+        # QQ适配器对象
+        self._ada_obj = None
+
+    def _ensure_ada(self):
+        """确保正确获取了QQ适配器对象"""
+        if self._ada_obj:
+            return
+        ada_name = None
+        ada = None
+        if self.qq_ada:
+            ada_name = self.qq_ada
+            ada = self.ctx.adapter_mgr.get_adapter(ada_name)
+        if not ada:
+            ada_infos = self.ctx.adapter_mgr.get_adapter_infos()
+            for info in ada_infos:
+                if info.platform == "QQ":
+                    ada_name = info.name
+            if not ada_name:
+                logger.error("未找到适配器平台为 QQ 的适配器，无法调用 OneBot 接口")
+                return None
+            ada = self.ctx.adapter_mgr.get_adapter(ada_name)
+            if not ada:
+                logger.error(f"未找到 {ada_name} 适配器，无法调用 OneBot 接口")
+                return None
+        self._ada_obj = ada
+    
+    async def _call_onebot_action(self, action: str, params: dict):
+        self._ensure_ada()
+        ada = self._ada_obj
+        ob_client = ada.get_client()
+        res = await ob_client.send_action(action, params)
+        return res
+
     def _load_persona(self) -> str:
-        try:
-            if PERSONA_PATH.exists():
-                with open(PERSONA_PATH, 'r', encoding='utf-8') as f:
-                    return f.read().strip()
-            else:
-                logger.warning("persona.txt 不存在，使用默认空字符串")
-                return ""
-        except Exception as e:
-            logger.error(f"读取 persona.txt 失败: {e}")
-            return ""
+        persona = self.ctx.persona_mgr.get_persona()
+        return persona
 
     def _add_post_to_history(self, text: str):
         self.my_posts_history.append(text)
         if len(self.my_posts_history) > MAX_HISTORY:
             self.my_posts_history.pop(0)
 
-    def _format_time(self, ts) -> str:
+    @staticmethod
+    def _format_time(ts) -> str:
         """将时间戳或时间字符串格式化为可读形式"""
         if isinstance(ts, (int, float)) and ts > 0:
             dt = datetime.fromtimestamp(ts)
@@ -213,7 +222,7 @@ class QzonePlugin(BasePlugin):
 
     async def _call_llm(self, prompt: str, system_prompt: Optional[str] = None) -> str:
         try:
-            client = await self.ctx.get_default_llm_client()
+            client = self.ctx.get_default_llm_client()
             if not client:
                 logger.error("无法获取默认 LLM 客户端")
                 return ""
@@ -245,30 +254,17 @@ class QzonePlugin(BasePlugin):
 
     # ---------- 新增：通过 LLOneBot 获取 Cookie ----------
     async def _get_cookie_from_llonebot(self) -> Optional[str]:
-        """通过 LLOneBot 的 HTTP 接口获取当前登录 QQ 的 Cookie（明文字符串）"""
-        try:
-            url = f"{self.llonebot_base}/get_cookies"
-            headers = {}
-            if self.access_token:
-                headers["Authorization"] = f"Bearer {self.access_token}"
-            # 请求体，指定域名
-            payload = {"domain": "user.qzone.qq.com"}
-            async with httpx.AsyncClient() as client:
-                resp = await client.post(url, json=payload, headers=headers, timeout=10)
-                resp.raise_for_status()
-                data = resp.json()
-                if data.get("status") != "ok":
-                    logger.error(f"LLOneBot 返回错误: {data}")
-                    return None
-                cookie_str = data.get("data", {}).get("cookies")
-                if not cookie_str:
-                    logger.error("返回数据中未找到 cookies 字段")
-                    return None
-                logger.info("成功从 LLOneBot 获取 Cookie")
-                return cookie_str
-        except Exception as e:
-            logger.error(f"从 LLOneBot 获取 Cookie 失败: {e}")
+        """向 LLOneBot 发送请求，获取指定域名的 Cookie 字符串"""
+        data = await self._call_onebot_action("get_cookies", {"domain": "user.qzone.qq.com"})
+        if data.get("status") != "ok":
+            logger.error(f"LLOneBot 返回错误: {data}")
             return None
+        cookie_str = data.get("data", {}).get("cookies")
+        if not cookie_str:
+            logger.error("返回数据中未找到 cookies 字段")
+            return None
+        logger.info("成功从 LLOneBot 获取 Cookie")
+        return cookie_str
 
     async def initialize(self):
         # 如果启用自动刷新，先尝试从 LLOneBot 获取最新 Cookie
@@ -320,12 +316,15 @@ class QzonePlugin(BasePlugin):
             return False
 
     async def terminate(self):
-        if self.api:
-            await self.api.close()
-        executor.shutdown(wait=False)
-        self.scheduler.shutdown()
-        if self._keep_alive_task:
-            self._keep_alive_task.cancel()
+        try:
+            if self.api:
+                await self.api.close()
+            executor.shutdown(wait=False)
+            self.scheduler.shutdown()
+            if self._keep_alive_task:
+                self._keep_alive_task.cancel()
+        except Exception as e:
+            logger.error(f"停止QQ空间插件时出错：{e}")
 
     async def _auto_refresh_cookie(self) -> str:
         """自动刷新 Cookie 的方法，被外部调用"""
@@ -589,23 +588,10 @@ class QzonePlugin(BasePlugin):
 
     # ---------- 获取私聊历史消息摘要 ----------
     async def _fetch_private_history(self, user_id: str, count: int = 10) -> List[str]:
-        api = "get_friend_msg_history"
-        params = {"user_id": int(user_id), "count": count}
-        headers = {}
-        if self.access_token:
-            headers["Authorization"] = f"Bearer {self.access_token}"
-        try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.post(
-                    f"{self.llonebot_base}/{api}",
-                    json=params,
-                    headers=headers,
-                    timeout=10
-                )
-                resp.raise_for_status()
-                result = resp.json()
-        except Exception as e:
-            logger.error(f"获取私聊历史失败: {e}")
+
+        result = await self._call_onebot_action("get_friend_msg_history", {"user_id": int(user_id), "count": count})
+        if not result or result.get("status") != "ok":
+            logger.error(f"获取私聊历史失败: {result}")
             return []
 
         if result.get("status") != "ok":
@@ -624,24 +610,7 @@ class QzonePlugin(BasePlugin):
         return summaries
 
     async def _fetch_recent_images_by_private(self, user_id: str, max_count: int = 1) -> List[str]:
-        api = "get_friend_msg_history"
-        params = {"user_id": int(user_id), "count": 20}
-        headers = {}
-        if self.access_token:
-            headers["Authorization"] = f"Bearer {self.access_token}"
-        try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.post(
-                    f"{self.llonebot_base}/{api}",
-                    json=params,
-                    headers=headers,
-                    timeout=10
-                )
-                resp.raise_for_status()
-                result = resp.json()
-        except Exception as e:
-            logger.error(f"获取私聊历史失败: {e}")
-            return []
+        result = await self._call_onebot_action("get_friend_msg_history", {"user_id": int(user_id), "count": 20})
 
         if result.get("status") != "ok":
             logger.error(f"llonebot返回错误: {result}")
@@ -668,23 +637,9 @@ class QzonePlugin(BasePlugin):
         return urls
 
     async def _fetch_group_history(self, group_id: str, count: int = 10) -> List[str]:
-        api = "get_group_msg_history"
-        params = {"group_id": int(group_id), "count": count}
-        headers = {}
-        if self.access_token:
-            headers["Authorization"] = f"Bearer {self.access_token}"
-        try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.post(
-                    f"{self.llonebot_base}/{api}",
-                    json=params,
-                    headers=headers,
-                    timeout=10
-                )
-                resp.raise_for_status()
-                result = resp.json()
-        except Exception as e:
-            logger.error(f"获取群历史失败: {e}")
+        result = await self._call_onebot_action("get_group_msg_history", {"group_id": int(group_id), "count": count})
+        if not result or result.get("status") != "ok":
+            logger.error(f"获取群历史失败: {result}")
             return []
 
         if result.get("status") != "ok":
@@ -703,25 +658,7 @@ class QzonePlugin(BasePlugin):
         return summaries
 
     async def _fetch_recent_images_by_group(self, group_id: str, max_count: int = 1) -> List[str]:
-        api = "get_group_msg_history"
-        params = {"group_id": int(group_id), "count": 20}
-        headers = {}
-        if self.access_token:
-            headers["Authorization"] = f"Bearer {self.access_token}"
-        try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.post(
-                    f"{self.llonebot_base}/{api}",
-                    json=params,
-                    headers=headers,
-                    timeout=10
-                )
-                resp.raise_for_status()
-                result = resp.json()
-        except Exception as e:
-            logger.error(f"获取群历史失败: {e}")
-            return []
-
+        result = await self._call_onebot_action("get_group_msg_history", {"group_id": int(group_id), "count": 20})
         if result.get("status") != "ok":
             logger.error(f"llonebot返回错误: {result}")
             return []
@@ -839,24 +776,8 @@ class QzonePlugin(BasePlugin):
         else:
             api = "get_friend_msg_history"
             params = {"user_id": int(session_id), "count": 20}
-
-        headers = {}
-        if self.access_token:
-            headers["Authorization"] = f"Bearer {self.access_token}"
-
-        try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.post(
-                    f"{self.llonebot_base}/{api}",
-                    json=params,
-                    headers=headers,
-                    timeout=10
-                )
-                resp.raise_for_status()
-                result = resp.json()
-        except Exception as e:
-            logger.error(f"获取历史消息失败: {e}")
-            return []
+        
+        result = await self._call_onebot_action(api, params)
 
         if result.get("status") != "ok":
             logger.error(f"llonebot返回错误: {result}")
@@ -1167,7 +1088,3 @@ class QzonePlugin(BasePlugin):
         except Exception as e:
             logger.error(f"回复失败，错误详情: {e}")
             return f"回复失败：{e}"
-
-
-if __name__ == "__main__":
-    pass
