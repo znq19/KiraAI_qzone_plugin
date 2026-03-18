@@ -1,0 +1,118 @@
+{
+    "cookies_str": {
+        "type": "text",
+        "default": "",
+        "hint": "QQ空间登录Cookie（可选，若启用自动刷新则不需要手动填写）。获取方法：浏览器登录 qzone.qq.com，按F12打开开发者工具，在Network中找到任意请求，复制Cookie字符串。"
+    },
+    "qq_account": {
+        "type": "string",
+        "default": "",
+        "hint": "QQ账号（用于自动登录，可选）"
+    },
+    "qq_password": {
+        "type": "string",
+        "default": "",
+        "hint": "QQ密码（用于自动登录，可选）"
+    },
+    "auto_refresh_cookie": {
+        "type": "boolean",
+        "default": true,
+        "hint": "是否启用自动刷新Cookie（通过LLOneBot获取）"
+    },
+    "master_ids": {
+        "type": "string",
+        "default": "",
+        "hint": "主人QQ号，多个用英文逗号分隔。只有这些QQ号才能使用QQ空间相关工具（发说说、评论、点赞等）。"
+    },
+    "timeout": {
+        "type": "int",
+        "default": 10,
+        "hint": "HTTP请求超时时间（秒）"
+    },
+    "temp_dir": {
+        "type": "string",
+        "default": "data/temp",
+        "hint": "临时文件存放目录（用于下载图片）"
+    },
+    "llonebot_host": {
+        "type": "string",
+        "default": "127.0.0.1",
+        "hint": "LLOneBot HTTP服务地址，通常为 127.0.0.1"
+    },
+    "llonebot_port": {
+        "type": "int",
+        "default": 3000,
+        "hint": "LLOneBot HTTP服务端口（与你的 LLOneBot 配置一致）"
+    },
+    "access_token": {
+        "type": "string",
+        "default": "",
+        "hint": "LLOneBot 访问令牌（如果有）"
+    },
+    "auto_publish_schedule": {
+        "type": "string",
+        "default": "",
+        "hint": "自动发布说说定时。支持两种格式：\n- Cron表达式，如 '0 8 * * *' 每天8点\n- 间隔表达式，如 '2h'（每2小时）或 '2h/30m'（每2小时±30分钟随机）\n留空则禁用。"
+    },
+    "auto_comment_schedule": {
+        "type": "string",
+        "default": "",
+        "hint": "自动评论定时，格式同上。"
+    },
+    "auto_reply_schedule": {
+        "type": "string",
+        "default": "",
+        "hint": "自动回复评论定时，格式同上。"
+    },
+    "auto_reply_enabled": {
+        "type": "boolean",
+        "default": false,
+        "hint": "是否开启自动回复评论（需配置auto_reply_schedule）"
+    },
+    "task_group_ids": {
+        "type": "string",
+        "default": "",
+        "hint": "用于接收定时任务指令的群号列表（多个用英文逗号分隔）。每次定时任务会随机选择一个群发送指令。"
+    },
+    "task_private_ids": {
+        "type": "string",
+        "default": "",
+        "hint": "用于接收定时任务指令的个人QQ号列表（多个用英文逗号分隔）。"
+    },
+    "task_message_style": {
+        "type": "string",
+        "enum": ["silent", "notify"],
+        "default": "silent",
+        "hint": "定时任务消息样式：silent=发送指令后不保留（无痕），notify=保留消息（通知大家）"
+    },
+    "auto_publish_group_id": {
+        "type": "string",
+        "default": "",
+        "hint": "用于获取聊天话题和图片的群号（后台直接生成模式专用，仅当未配置任何任务目标时生效）"
+    },
+    "auto_publish_user_id": {
+        "type": "string",
+        "default": "",
+        "hint": "用于获取聊天话题和图片的个人QQ号（后台直接生成模式专用，仅当未配置任何任务目标且未配置群号时生效）"
+    },
+    "auto_publish_image_prob": {
+        "type": "float",
+        "default": 0.5,
+        "hint": "自动发布时配图的概率（0-1），0表示从不配图，1表示每次都配图"
+    },
+    "max_comments_per_cycle": {
+        "type": "int",
+        "default": 3,
+        "hint": "每次自动评论最多评论多少条说说（随机选择）"
+    },
+    "max_replies_per_cycle": {
+        "type": "int",
+        "default": 5,
+        "hint": "每次自动回复任务最多回复多少条新评论"
+    },
+    "like_when_comment": {
+        "type": "boolean",
+        "default": true,
+        "hint": "自动评论时是否同时点赞"
+    }
+}
