@@ -268,7 +268,7 @@ A：不需要。v1.30 已合并通用代码，只需确保 `qq_ada` 配置正确
 
 本插件基于 AstrBot 的 [astrbot_plugin_qzone](https://github.com/Zhalslar/astrbot_plugin_qzone) 移植改造，感谢原作者的贡献。特别感谢 [Maizone](https://github.com/internetsb/Maizone) 项目在 Cookie 自动获取策略上提供的宝贵思路与借鉴，让插件真正稳定易用。  
 v1.30 的全面优化与改进特别感谢 KiraAI 开发者 [@xxynet](https://github.com/xxynet) 的大力帮助！  
-本项目作为KiraAI的衍生品，AGPL-3.0 协议开源，可协议范围内自由使用和修改。
+本项目作为KiraAI的附属品，AGPL-3.0 协议开源，可协议范围内自由使用和修改。
 
 ---
 
