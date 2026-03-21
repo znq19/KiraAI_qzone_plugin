@@ -66,7 +66,7 @@ KiraAI-main/
 ```cmd
 cd C:\Users\你的用户名\Desktop\KiraAI-main（请根据自己的kira项目主目录修改！）
 .venv\Scripts\activate
-pip install apscheduler beautifulsoup4 json5 httpx
+pip install apscheduler beautifulsoup4 json5 httpx aiohttp
 ```
 
 > **说明**：v1.30 已彻底移除旧的无用依赖（如 selenium），仅保留必要的库。
