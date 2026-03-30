@@ -65,7 +65,7 @@ KiraAI-main/
 
 ```cmd
 cd C:\Users\你的用户名\Desktop\KiraAI-main（请根据自己的kira项目主目录修改！）
-.venv\Scripts\activate
+venv\Scripts\activate
 pip install apscheduler beautifulsoup4 json5 httpx aiohttp
 ```
 
