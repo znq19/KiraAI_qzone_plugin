@@ -1,0 +1,8 @@
+{
+    "display_name": "QQ空间助手",
+    "plugin_id": "qzone_plugin",
+    "version": "1.3.0",
+    "author": "KiraAI+znq19",
+    "description": "集成QQ空间功能：发说说、看说说、点赞、评论、访客统计，AI可自动调用。",
+    "repo": "https://github.com/znq19/KiraAI_qzone_plugin"
+}
