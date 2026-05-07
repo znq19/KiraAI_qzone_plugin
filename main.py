@@ -66,7 +66,7 @@ class QzonePlugin(BasePlugin):
         self.cfg = cfg
         self.cookies_str = cfg.get("cookies_str", "")
         self.qq_ada = cfg.get("qq_ada", "")
-        self.auto_refresh = cfg.get("auto_refresh_cookie", True)
+        self.auto_refresh = cfg.get("auto_refresh_cookie", True)   # 开关：是否强制每次刷新
         self.timeout = cfg.get("timeout", 10)
         self.temp_dir = Path(cfg.get("temp_dir", "data/temp"))
         self.temp_dir.mkdir(parents=True, exist_ok=True)
@@ -115,19 +115,86 @@ class QzonePlugin(BasePlugin):
 
         self.replied_comments = set()
 
-        self.persona_content = self._load_persona()
+        self.persona_content = None  # 延迟加载
         self.my_posts_history: List[str] = []
         self.last_auto_publish_time: Optional[datetime] = None
         self._jobs_added = False
 
-        # 保活任务标志
-        self._keep_alive_task = None
+        # 用于控制刷新频率的锁和上次刷新时间
+        self._cookie_refresh_lock = asyncio.Lock()
+        self._last_cookie_refresh = 0.0
 
         # QQ适配器对象
         self._ada_obj = None
 
+        # 初始化失败标记（用于首次启动时 oneBot 未就绪）
+        self._init_failed = False
+
+    # ---------- Persona 兼容适配 ----------
+    async def _get_persona_content(self) -> str:
+        """兼容新旧版本的 persona 获取方法"""
+        try:
+            persona_info = await self.ctx.persona_mgr.get_persona()
+            return persona_info.content if persona_info else ""
+        except TypeError:
+            return self.ctx.persona_mgr.get_persona() or ""
+
+    # ---------- 强制刷新 Cookie ----------
+    async def _refresh_cookie(self, force: bool = True):
+        """从 oneBot 获取最新 Cookie 并重新初始化 API 会话"""
+        if not self.auto_refresh:
+            return
+        async with self._cookie_refresh_lock:
+            import time
+            now = time.time()
+            if not force and (now - self._last_cookie_refresh) < 60:
+                return
+            new_cookie = await self._get_cookie_from_onebot()
+            if new_cookie:
+                self.cookies_str = new_cookie
+                await self._reinit_session()
+                self._last_cookie_refresh = now
+                self._init_failed = False
+                logger.info("已从 oneBot 获取最新 Cookie 并重新初始化 API")
+            else:
+                logger.warning("从 oneBot 获取 Cookie 失败，将使用已有 Cookie（可能已过期）")
+                self._init_failed = True
+
+    async def _ensure_api(self):
+        """确保 API 已初始化，并在启用自动刷新时强制刷新 Cookie"""
+        if self.auto_refresh:
+            await self._refresh_cookie(force=True)
+        else:
+            if self.api is None or self._init_failed:
+                await self._reinit_session()
+
+    async def _reinit_session(self):
+        """根据当前 self.cookies_str 重新初始化 session 和 api，先关闭旧的"""
+        if self.api:
+            try:
+                await self.api.close()
+            except Exception as e:
+                logger.warning(f"关闭旧 API 时出错: {e}")
+        if self.session:
+            # session 没有 close 方法，但 api.close 会关闭 client session
+            pass
+        try:
+            config = type("Config", (), {
+                "cookies_str": self.cookies_str,
+                "timeout": self.timeout
+            })()
+            self.session = QzoneSession(config)
+            self.api = QzoneAPI(self.session, config)
+            ctx = await self.session.get_ctx()
+            self.my_uin = ctx.uin
+            logger.info(f"QQ空间 API 初始化成功，当前账号: {self.my_uin}")
+            self._init_failed = False
+        except Exception as e:
+            logger.error(f"重新初始化失败: {e}")
+            self._init_failed = True
+            raise
+
     def _ensure_ada(self):
-        """确保正确获取了QQ适配器对象"""
         if self._ada_obj:
             return
         ada_name = None
@@ -148,7 +215,7 @@ class QzonePlugin(BasePlugin):
                 logger.error(f"未找到 {ada_name} 适配器，无法调用 OneBot 接口")
                 return None
         self._ada_obj = ada
-    
+
     async def _call_onebot_action(self, action: str, params: dict):
         self._ensure_ada()
         ada = self._ada_obj
@@ -156,219 +223,62 @@ class QzonePlugin(BasePlugin):
         res = await ob_client.send_action(action, params)
         return res
 
-    def _load_persona(self) -> str:
-        persona = self.ctx.persona_mgr.get_persona()
-        return persona
-
-    def _add_post_to_history(self, text: str):
-        self.my_posts_history.append(text)
-        if len(self.my_posts_history) > MAX_HISTORY:
-            self.my_posts_history.pop(0)
-
-    @staticmethod
-    def _format_time(ts) -> str:
-        """将时间戳或时间字符串格式化为可读形式"""
-        if isinstance(ts, (int, float)) and ts > 0:
-            dt = datetime.fromtimestamp(ts)
-            return dt.strftime("%Y-%m-%d %H:%M")
-        elif isinstance(ts, str):
-            return ts
-        else:
-            return "未知时间"
-
-    def _parse_schedule(self, s: str) -> Optional[dict]:
-        """解析调度字符串，返回包含 mode 和参数的字典，或 None（禁用）
-        格式示例：
-            - cron: "0 8 * * *"
-            - interval: "2h" 或 "2h/30m" 或 "20m" 或 "20m/5m"
-        """
-        if not s or not s.strip():
-            return None
-        s = s.strip()
-
-        if ' ' in s or '*' in s or '/' in s:
-            try:
-                CronTrigger.from_crontab(s)
-                return {"mode": "cron", "expr": s}
-            except Exception:
-                pass
-
-        pattern = r'^(?P<interval>\d+(?:\.\d+)?[hm]?)(?:/(?P<jitter>\d+(?:\.\d+)?[hm]?))?$'
-        match = re.match(pattern, s)
-        if match:
-            interval_str = match.group('interval')
-            jitter_str = match.group('jitter')
-
-            def parse_time(t):
-                if t.endswith('h'):
-                    return float(t[:-1]) * 3600
-                elif t.endswith('m'):
-                    return float(t[:-1]) * 60
-                else:
-                    return float(t) * 60
-
-            interval_seconds = parse_time(interval_str)
-            jitter_seconds = parse_time(jitter_str) if jitter_str else 0
-            if interval_seconds <= 0:
+    async def _get_cookie_from_onebot(self) -> Optional[str]:
+        try:
+            data = await self._call_onebot_action("get_cookies", {"domain": "user.qzone.qq.com"})
+            if data.get("status") != "ok":
+                logger.error(f"oneBot 返回错误: {data}")
                 return None
-            return {
-                "mode": "interval",
-                "interval_seconds": int(interval_seconds),
-                "jitter_seconds": int(jitter_seconds)
-            }
-
-        logger.warning(f"无法解析定时表达式: {s}，任务将被禁用")
-        return None
-
-    async def _call_llm(self, prompt: str, system_prompt: Optional[str] = None) -> str:
-        try:
-            client = self.ctx.get_default_llm_client()
-            if not client:
-                logger.error("无法获取默认 LLM 客户端")
-                return ""
-            messages = []
-            if system_prompt:
-                messages.append({"role": "system", "content": system_prompt})
-            messages.append({"role": "user", "content": prompt})
-            request = LLMRequest(messages=messages)
-            response = await client.chat(request)
-            return response.text_response.strip()
+            cookie_str = data.get("data", {}).get("cookies")
+            if not cookie_str:
+                logger.error("返回数据中未找到 cookies 字段")
+                return None
+            logger.info("成功从 oneBot 获取 Cookie")
+            return cookie_str
         except Exception as e:
-            logger.error(f"LLM 调用失败: {e}")
-            return ""
-
-    async def _reinit_session(self):
-        """重新初始化 session 和 api（Cookie 更新后调用）"""
-        try:
-            config = type("Config", (), {
-                "cookies_str": self.cookies_str,
-                "timeout": self.timeout
-            })()
-            self.session = QzoneSession(config)
-            self.api = QzoneAPI(self.session, config)
-            ctx = await self.session.get_ctx()
-            self.my_uin = ctx.uin
-            logger.info(f"Cookie 更新后重新初始化成功，当前账号: {self.my_uin}")
-        except Exception as e:
-            logger.error(f"重新初始化失败: {e}")
-
-    # ---------- 新增：通过 LLOneBot 获取 Cookie ----------
-    async def _get_cookie_from_llonebot(self) -> Optional[str]:
-        """向 LLOneBot 发送请求，获取指定域名的 Cookie 字符串"""
-        data = await self._call_onebot_action("get_cookies", {"domain": "user.qzone.qq.com"})
-        if data.get("status") != "ok":
-            logger.error(f"LLOneBot 返回错误: {data}")
+            logger.error(f"从 oneBot 获取 Cookie 失败: {e}")
             return None
-        cookie_str = data.get("data", {}).get("cookies")
-        if not cookie_str:
-            logger.error("返回数据中未找到 cookies 字段")
-            return None
-        logger.info("成功从 LLOneBot 获取 Cookie")
-        return cookie_str
 
+    # ---------- 插件生命周期 ----------
     async def initialize(self):
-        # 如果启用自动刷新，先尝试从 LLOneBot 获取最新 Cookie
+        self.persona_content = await self._get_persona_content()
+
         if self.auto_refresh:
-            new_cookie = await self._get_cookie_from_llonebot()
+            new_cookie = await self._get_cookie_from_onebot()
             if new_cookie:
                 self.cookies_str = new_cookie
-                logger.info("已从 LLOneBot 获取最新 Cookie")
+                logger.info("首次获取 Cookie 成功")
             else:
-                logger.warning("从 LLOneBot 获取 Cookie 失败，将使用配置中的旧 Cookie")
-
-        if not self.cookies_str:
-            logger.error("未提供Cookie，插件无法工作")
-            return
+                logger.warning("首次获取 Cookie 失败，将使用配置中的旧 Cookie（可能已过期）")
+                self._init_failed = True
+        else:
+            if not self.cookies_str:
+                logger.error("未提供 Cookie 且未启用自动刷新，插件无法工作")
+                return
 
         try:
-            config = type("Config", (), {
-                "cookies_str": self.cookies_str,
-                "timeout": self.timeout
-            })()
-            self.session = QzoneSession(config)
-            self.api = QzoneAPI(self.session, config)
-            ctx = await self.session.get_ctx()
-            self.my_uin = ctx.uin
-            logger.info(f"QQ空间插件初始化完成，当前账号: {self.my_uin}")
-
-            await self._setup_scheduled_jobs()
-
-            # 启动保活任务（如果启用自动刷新）
-            if self.auto_refresh:
-                self._keep_alive_task = asyncio.create_task(self._keep_alive_loop())
-
+            await self._reinit_session()
         except Exception as e:
-            logger.error(f"初始化API失败: {e}")
+            logger.error(f"初始化 API 失败: {e}")
+            if not self.auto_refresh:
+                # 如果未启用自动刷新且初始化失败，则无法工作
+                return
 
-    async def _test_cookie(self) -> bool:
-        if not self.cookies_str:
-            return False
-        try:
-            config = type("Config", (), {
-                "cookies_str": self.cookies_str,
-                "timeout": self.timeout
-            })()
-            session = QzoneSession(config)
-            api = QzoneAPI(session, config)
-            test = await api.get_visitor()
-            return test.ok
-        except Exception:
-            return False
+        await self._setup_scheduled_jobs()
+        logger.info("QQ空间插件初始化完成")
 
     async def terminate(self):
         try:
             if self.api:
                 await self.api.close()
+            for job in self.scheduler.get_jobs():
+                job.remove()
+            self.scheduler.shutdown(wait=False)
             executor.shutdown(wait=False)
-            self.scheduler.shutdown()
-            if self._keep_alive_task:
-                self._keep_alive_task.cancel()
         except Exception as e:
             logger.error(f"停止QQ空间插件时出错：{e}")
 
-    async def _auto_refresh_cookie(self) -> str:
-        """自动刷新 Cookie 的方法，被外部调用"""
-        logger.info("尝试自动获取Cookie...")
-        new_cookie = await self._get_cookie_from_llonebot()
-        if new_cookie:
-            return new_cookie
-        else:
-            return ""
-
-    # ---------- 保活任务（使用访客接口） ----------
-    async def _keep_alive_loop(self):
-        """每5分钟发送一次登录保持请求（使用访客接口），若失败则重新获取 Cookie"""
-        while True:
-            try:
-                if not self.cookies_str or not self.my_uin:
-                    await asyncio.sleep(60)
-                    continue
-
-                # 使用访客接口，不需要 g_tk
-                url = "https://h5.qzone.qq.com/proxy/domain/g.qzone.qq.com/cgi-bin/friendshow/cgi_get_visitor_more"
-                headers = {
-                    "Cookie": self.cookies_str,
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                }
-                async with httpx.AsyncClient() as client:
-                    resp = await client.get(url, headers=headers, timeout=10)
-                    if resp.status_code == 200:
-                        logger.debug("登录保持成功")
-                    else:
-                        logger.warning(f"登录保持失败，状态码 {resp.status_code}，尝试重新获取 Cookie")
-                        new_cookie = await self._get_cookie_from_llonebot()
-                        if new_cookie:
-                            self.cookies_str = new_cookie
-                            await self._reinit_session()
-                        else:
-                            logger.error("重新获取 Cookie 失败")
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"保活任务异常: {e}")
-            await asyncio.sleep(1800)  # 30分钟
-
-    # ---------- 以下为原有功能，完全不变 ----------
+    # ---------- 定时任务 ----------
     async def _setup_scheduled_jobs(self):
         if self._jobs_added:
             logger.warning("定时任务已添加，跳过")
@@ -403,7 +313,6 @@ class QzonePlugin(BasePlugin):
             logger.info("定时任务调度器已启动")
             self._jobs_added = True
 
-    # ---------- 通用：向目标发送指令 ----------
     async def _send_task_instruction(self, instruction_text: str) -> bool:
         targets = []
         for gid in self.task_group_ids:
@@ -421,12 +330,13 @@ class QzonePlugin(BasePlugin):
         logger.info(f"已向 {target_type} {target_id} 发送指令: {instruction_text[:30]}...")
         return True
 
-    # ---------- 自动发布说说 ----------
     async def _auto_publish_job(self):
         try:
             if self.last_auto_publish_time and (datetime.now() - self.last_auto_publish_time).total_seconds() < 60:
                 logger.warning("距离上次自动发布不足60秒，跳过本次自动发布")
                 return
+
+            await self._ensure_api()
 
             if self.task_group_ids or self.task_private_ids:
                 instruction = "【定时任务】请根据最近聊天发布一条说说，自然一点，不要提及这是定时任务。"
@@ -436,41 +346,9 @@ class QzonePlugin(BasePlugin):
 
             await self._legacy_auto_publish()
             self.last_auto_publish_time = datetime.now()
-
         except Exception as e:
             logger.error(f"自动发布任务失败: {e}")
 
-    # ---------- 自动评论 ----------
-    async def _auto_comment_job(self):
-        try:
-            if self.task_group_ids or self.task_private_ids:
-                instruction = "【评论任务】请对最近的好友说说进行评论，自然一点。严禁内容重复和复读。优先没有评论过的内容，该内容时间戳与当前系统时间戳不得超过7天，否则不评论。"
-                await self._send_task_instruction(instruction)
-                return
-
-            await self._legacy_auto_comment()
-
-        except Exception as e:
-            logger.error(f"自动评论任务失败: {e}")
-
-    # ---------- 自动回复 ----------
-    async def _auto_reply_job(self):
-        try:
-            if not self.my_uin:
-                logger.error("无法获取当前账号的QQ号")
-                return
-
-            if self.task_group_ids or self.task_private_ids:
-                instruction = "【回复任务】请回复你最近说说下的新评论，开头必须qzone_reply_comment(target_id, tid, comment_id, content)，自然一点，严禁内容重复和复读。检测target_id来不回复自己。优先没有回复过的用户和新回复，否则不回复。"
-                await self._send_task_instruction(instruction)
-                return
-
-            await self._legacy_auto_reply()
-
-        except Exception as e:
-            logger.error(f"自动回复任务失败: {e}")
-
-    # ---------- 后台模式（原有逻辑）----------
     async def _legacy_auto_publish(self):
         source_id = None
         source_type = None
@@ -494,7 +372,7 @@ class QzonePlugin(BasePlugin):
             except Exception as e:
                 logger.error(f"获取历史失败: {e}")
 
-        system_prompt = self.persona_content
+        system_prompt = self.persona_content or ""
         if self.my_posts_history:
             history_str = "\n".join([f"- {post}" for post in self.my_posts_history[-5:]])
             system_prompt += f"\n\n你最近发布的说说是：\n{history_str}"
@@ -511,19 +389,31 @@ class QzonePlugin(BasePlugin):
             return
 
         image_urls = []
-        if self.auto_publish_image_prob > 0 and random.random() < self.auto_publish_image_prob:
-            if source_id:
-                if source_type == "group":
-                    img_urls = await self._fetch_recent_images_by_group(source_id, max_count=1)
-                else:
-                    img_urls = await self._fetch_recent_images_by_private(source_id, max_count=1)
-                if img_urls:
-                    image_urls = img_urls
-                    logger.info("自动发布带图")
+        if source_id and self.auto_publish_image_prob > 0 and random.random() < self.auto_publish_image_prob:
+            if source_type == "group":
+                img_urls = await self._fetch_recent_images_by_group(source_id, max_count=1)
+            else:
+                img_urls = await self._fetch_recent_images_by_private(source_id, max_count=1)
+            if img_urls:
+                image_urls = img_urls
+                logger.info(f"自动发布带图: {img_urls[0][:50]}...")
+            else:
+                logger.info("未找到图片，将只发布文字")
 
         await self._publish(text, image_urls)
         self._add_post_to_history(text)
         logger.info(f"自动发布说说成功: {text} (图片数: {len(image_urls)})")
+
+    async def _auto_comment_job(self):
+        try:
+            await self._ensure_api()
+            if self.task_group_ids or self.task_private_ids:
+                instruction = "【评论任务】请对最近的好友（不包括自己）说说进行评论，自然一点。严禁内容重复和复读。注意，检查用户昵称来不要评论自己发布的QQ说说，优先没有评论过的内容，该内容时间戳与当前系统时间戳不得超过7天，否则不评论。"
+                await self._send_task_instruction(instruction)
+                return
+            await self._legacy_auto_comment()
+        except Exception as e:
+            logger.error(f"自动评论任务失败: {e}")
 
     async def _legacy_auto_comment(self):
         try:
@@ -544,6 +434,17 @@ class QzonePlugin(BasePlugin):
                 await asyncio.sleep(2)
         except Exception as e:
             logger.error(f"自动评论任务失败: {e}")
+
+    async def _auto_reply_job(self):
+        try:
+            await self._ensure_api()
+            if self.task_group_ids or self.task_private_ids:
+                instruction = "【回复任务】请回复你最近说说下的新评论，开头必须qzone_reply_comment(target_id, tid, comment_id, content)，target_id为自己的QQ号，自然一点，严禁内容重复和复读。检测comment_id来不回复自己。优先没有回复过的用户和新回复，否则不回复。"
+                await self._send_task_instruction(instruction)
+                return
+            await self._legacy_auto_reply()
+        except Exception as e:
+            logger.error(f"自动回复任务失败: {e}")
 
     async def _legacy_auto_reply(self):
         try:
@@ -586,22 +487,15 @@ class QzonePlugin(BasePlugin):
         except Exception as e:
             logger.error(f"自动回复任务失败: {e}")
 
-    # ---------- 获取私聊历史消息摘要 ----------
+    # ---------- 辅助方法 ----------
     async def _fetch_private_history(self, user_id: str, count: int = 10) -> List[str]:
-
         result = await self._call_onebot_action("get_friend_msg_history", {"user_id": int(user_id), "count": count})
         if not result or result.get("status") != "ok":
             logger.error(f"获取私聊历史失败: {result}")
             return []
-
-        if result.get("status") != "ok":
-            logger.error(f"llonebot返回错误: {result}")
-            return []
-
         messages = result.get("data", {}).get("messages", [])
         if not messages:
             return []
-
         summaries = []
         for msg in messages[-count:]:
             sender = msg.get("sender", {}).get("nickname", "对方")
@@ -611,15 +505,12 @@ class QzonePlugin(BasePlugin):
 
     async def _fetch_recent_images_by_private(self, user_id: str, max_count: int = 1) -> List[str]:
         result = await self._call_onebot_action("get_friend_msg_history", {"user_id": int(user_id), "count": 20})
-
         if result.get("status") != "ok":
-            logger.error(f"llonebot返回错误: {result}")
+            logger.error(f"oneBot返回错误: {result}")
             return []
-
         messages = result.get("data", {}).get("messages", [])
         if not messages:
             return []
-
         urls = []
         for msg in reversed(messages):
             msg_segments = msg.get("message", [])
@@ -641,15 +532,9 @@ class QzonePlugin(BasePlugin):
         if not result or result.get("status") != "ok":
             logger.error(f"获取群历史失败: {result}")
             return []
-
-        if result.get("status") != "ok":
-            logger.error(f"llonebot返回错误: {result}")
-            return []
-
         messages = result.get("data", {}).get("messages", [])
         if not messages:
             return []
-
         summaries = []
         for msg in messages[-count:]:
             sender = msg.get("sender", {}).get("nickname", "未知")
@@ -660,13 +545,11 @@ class QzonePlugin(BasePlugin):
     async def _fetch_recent_images_by_group(self, group_id: str, max_count: int = 1) -> List[str]:
         result = await self._call_onebot_action("get_group_msg_history", {"group_id": int(group_id), "count": 20})
         if result.get("status") != "ok":
-            logger.error(f"llonebot返回错误: {result}")
+            logger.error(f"oneBot返回错误: {result}")
             return []
-
         messages = result.get("data", {}).get("messages", [])
         if not messages:
             return []
-
         urls = []
         for msg in reversed(messages):
             msg_segments = msg.get("message", [])
@@ -691,6 +574,7 @@ class QzonePlugin(BasePlugin):
         return " ".join(texts)
 
     async def _fetch_recent_images(self, event: KiraMessageBatchEvent, max_count: int = 1) -> List[str]:
+        """从触发事件的消息中获取最近的图片URL（用于自动配图）"""
         session_type = None
         session_id = None
 
@@ -700,7 +584,6 @@ class QzonePlugin(BasePlugin):
                 if gid:
                     session_type = "group"
                     session_id = str(gid)
-                    logger.debug(f"通过 get_group_id 获取到群ID: {session_id}")
         except Exception:
             pass
 
@@ -710,7 +593,6 @@ class QzonePlugin(BasePlugin):
                 if gid:
                     session_type = "group"
                     session_id = str(gid)
-                    logger.debug(f"通过 group_id 属性获取到群ID: {session_id}")
             except Exception:
                 pass
 
@@ -720,7 +602,6 @@ class QzonePlugin(BasePlugin):
                 if gid:
                     session_type = "group"
                     session_id = str(gid)
-                    logger.debug(f"通过 message_obj.group.group_id 获取到群ID: {session_id}")
             except Exception:
                 pass
 
@@ -731,7 +612,6 @@ class QzonePlugin(BasePlugin):
                     if uid:
                         session_type = "private"
                         session_id = str(uid)
-                        logger.debug(f"通过 get_user_id 获取到用户ID: {session_id}")
             except Exception:
                 pass
 
@@ -741,7 +621,6 @@ class QzonePlugin(BasePlugin):
                 if uid:
                     session_type = "private"
                     session_id = str(uid)
-                    logger.debug(f"通过 user_id 属性获取到用户ID: {session_id}")
             except Exception:
                 pass
 
@@ -751,7 +630,6 @@ class QzonePlugin(BasePlugin):
                 if uid:
                     session_type = "private"
                     session_id = str(uid)
-                    logger.debug(f"通过 message_obj.sender.user_id 获取到用户ID: {session_id}")
             except Exception:
                 pass
 
@@ -760,11 +638,9 @@ class QzonePlugin(BasePlugin):
             if hasattr(first_msg, 'group') and first_msg.group:
                 session_type = "group"
                 session_id = first_msg.group.group_id
-                logger.debug(f"从第一条消息的 group 获取到群ID: {session_id}")
             elif hasattr(first_msg, 'sender') and first_msg.sender:
                 session_type = "private"
                 session_id = first_msg.sender.user_id
-                logger.debug(f"从第一条消息的 sender 获取到用户ID: {session_id}")
 
         if not session_id:
             logger.error("无法从事件中获取会话ID")
@@ -776,11 +652,10 @@ class QzonePlugin(BasePlugin):
         else:
             api = "get_friend_msg_history"
             params = {"user_id": int(session_id), "count": 20}
-        
-        result = await self._call_onebot_action(api, params)
 
+        result = await self._call_onebot_action(api, params)
         if result.get("status") != "ok":
-            logger.error(f"llonebot返回错误: {result}")
+            logger.error(f"oneBot返回错误: {result}")
             return []
 
         messages = result.get("data", {}).get("messages", [])
@@ -803,7 +678,9 @@ class QzonePlugin(BasePlugin):
                 break
         return urls
 
+    # ---------- 核心 API 封装（均会先确保 API 可用） ----------
     async def _publish(self, text: str, image_urls: list[str]) -> str:
+        await self._ensure_api()
         post = QzonePost(text=text, images=image_urls)
         resp = await self.api.publish(post)
         if not resp.ok:
@@ -812,6 +689,7 @@ class QzonePlugin(BasePlugin):
         return f"说说发布成功！TID: {tid}"
 
     async def _get_feeds(self, target_id: Optional[str] = None, num: int = 1) -> list[QzonePost]:
+        await self._ensure_api()
         if target_id:
             resp = await self.api.get_feeds(target_id, pos=0, num=num)
         else:
@@ -826,24 +704,28 @@ class QzonePlugin(BasePlugin):
         return posts[:num]
 
     async def _like(self, post: QzonePost) -> str:
+        await self._ensure_api()
         resp = await self.api.like(post)
         if not resp.ok:
             raise RuntimeError(f"点赞失败: {resp.message}")
         return "点赞成功"
 
     async def _comment(self, post: QzonePost, content: str) -> str:
+        await self._ensure_api()
         resp = await self.api.comment(post, content)
         if not resp.ok:
             raise RuntimeError(f"评论失败: {resp.message}")
         return "评论成功"
 
     async def _delete(self, tid: str) -> str:
+        await self._ensure_api()
         resp = await self.api.delete(tid)
         if not resp.ok:
             raise RuntimeError(f"删除失败: {resp.message}")
         return f"说说 {tid} 删除成功"
 
     async def _reply_comment(self, post: QzonePost, comment: QzoneComment, content: str = "") -> str:
+        await self._ensure_api()
         if not content:
             prompt = f"用户 {comment.nickname} 评论了你的说说：{comment.content}，请生成一条友好回复（10-30字）。"
             content = await self._call_llm(prompt, self.persona_content)
@@ -854,7 +736,24 @@ class QzonePlugin(BasePlugin):
         await self.api.reply(post, comment, content)
         return f"回复成功: {content}"
 
-    # ---------- 权限检查辅助函数 ----------
+    async def _call_llm(self, prompt: str, system_prompt: Optional[str] = None) -> str:
+        try:
+            client = self.ctx.get_default_llm_client()
+            if not client:
+                logger.error("无法获取默认 LLM 客户端")
+                return ""
+            messages = []
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
+            messages.append({"role": "user", "content": prompt})
+            request = LLMRequest(messages=messages)
+            response = await client.chat(request)
+            return response.text_response.strip()
+        except Exception as e:
+            logger.error(f"LLM 调用失败: {e}")
+            return ""
+
+    # ---------- 权限检查 ----------
     async def _check_master(self, event: KiraMessageBatchEvent) -> bool:
         if not self.master_ids:
             return True
@@ -876,6 +775,55 @@ class QzonePlugin(BasePlugin):
         logger.warning(f"用户 {user_id} 尝试使用QQ空间工具，但不在主人列表中")
         return False
 
+    def _add_post_to_history(self, text: str):
+        self.my_posts_history.append(text)
+        if len(self.my_posts_history) > MAX_HISTORY:
+            self.my_posts_history.pop(0)
+
+    @staticmethod
+    def _format_time(ts) -> str:
+        if isinstance(ts, (int, float)) and ts > 0:
+            dt = datetime.fromtimestamp(ts)
+            return dt.strftime("%Y-%m-%d %H:%M")
+        elif isinstance(ts, str):
+            return ts
+        else:
+            return "未知时间"
+
+    def _parse_schedule(self, s: str) -> Optional[dict]:
+        if not s or not s.strip():
+            return None
+        s = s.strip()
+        if ' ' in s or '*' in s or '/' in s:
+            try:
+                CronTrigger.from_crontab(s)
+                return {"mode": "cron", "expr": s}
+            except Exception:
+                pass
+        pattern = r'^(?P<interval>\d+(?:\.\d+)?[hm]?)(?:/(?P<jitter>\d+(?:\.\d+)?[hm]?))?$'
+        match = re.match(pattern, s)
+        if match:
+            interval_str = match.group('interval')
+            jitter_str = match.group('jitter')
+            def parse_time(t):
+                if t.endswith('h'):
+                    return float(t[:-1]) * 3600
+                elif t.endswith('m'):
+                    return float(t[:-1]) * 60
+                else:
+                    return float(t) * 60
+            interval_seconds = parse_time(interval_str)
+            jitter_seconds = parse_time(jitter_str) if jitter_str else 0
+            if interval_seconds <= 0:
+                return None
+            return {
+                "mode": "interval",
+                "interval_seconds": int(interval_seconds),
+                "jitter_seconds": int(jitter_seconds)
+            }
+        logger.warning(f"无法解析定时表达式: {s}，任务将被禁用")
+        return None
+
     # ---------- 工具注册 ----------
     @register_tool(
         name="qzone_publish",
@@ -884,7 +832,7 @@ class QzonePlugin(BasePlugin):
             "type": "object",
             "properties": {
                 "text": {"type": "string", "description": "说说内容"},
-                "image_urls": {"type": "array", "items": {"type": "string"}, "description": "图片URL列表（可选，如果用户指定了图片，请填入URL；否则留空，插件会自动选一张）", "default": []}
+                "image_urls": {"type": "array", "items": {"type": "string"}, "description": "图片URL列表（可选）", "default": []}
             },
             "required": ["text"]
         }
@@ -892,24 +840,14 @@ class QzonePlugin(BasePlugin):
     async def tool_publish(self, event: KiraMessageBatchEvent, text: str, image_urls: list[str] = []):
         if not await self._check_master(event):
             return "抱歉，只有主人才能使用此功能。"
-
+        await self._ensure_api()
         try:
             valid_urls = []
             for url in image_urls:
-                if url.startswith('http') and 'example.com' not in url and 'image_url_from' not in url and 'previous_message' not in url:
+                if url.startswith('http') and 'example.com' not in url:
                     valid_urls.append(url)
-                else:
-                    logger.warning(f"AI提供了无效的图片URL: {url}，将忽略")
-
             if not valid_urls:
                 valid_urls = await self._fetch_recent_images(event, max_count=1)
-                if valid_urls:
-                    logger.info(f"自动获取到 1 张最近的图片")
-                else:
-                    logger.info("未找到图片，将只发布文字")
-            else:
-                logger.info(f"使用AI提供的 {len(valid_urls)} 张图片")
-
             result = await self._publish(text, valid_urls)
             self._add_post_to_history(text)
             return result
@@ -918,16 +856,19 @@ class QzonePlugin(BasePlugin):
 
     @register_tool(
         name="qzone_view",
-        description="查看QQ空间说说。如果不提供target_id，默认查看自己的空间；要查看好友动态，请提供好友QQ号。返回的每条说说会包含ID、发布时间和最新评论，每条评论会显示评论者昵称、评论ID、时间和内容。",
+        description="查看QQ空间说说。如果不提供target_id，默认查看自己的空间；要查看好友动态，请提供好友QQ号。返回的每条说说会包含ID、发布时间和最新评论。",
         params={
             "type": "object",
             "properties": {
-                "target_id": {"type": "string", "description": "目标QQ号（可选，不填则查看自己的空间）"},
+                "target_id": {"type": "string", "description": "目标QQ号（可选）"},
                 "num": {"type": "integer", "description": "查看条数，默认1", "default": 1}
             },
         }
     )
     async def tool_view(self, event: KiraMessageBatchEvent, target_id: str = None, num: int = 1):
+        if not await self._check_master(event):
+            return "抱歉，只有主人才能使用此功能。"
+        await self._ensure_api()
         try:
             if target_id is None:
                 if self.my_uin is None:
@@ -969,7 +910,7 @@ class QzonePlugin(BasePlugin):
     async def tool_like(self, event: KiraMessageBatchEvent, target_id: str, tid: str):
         if not await self._check_master(event):
             return "抱歉，只有主人才能使用此功能。"
-
+        await self._ensure_api()
         post = QzonePost(uin=int(target_id), tid=tid)
         try:
             result = await self._like(post)
@@ -985,7 +926,7 @@ class QzonePlugin(BasePlugin):
             "properties": {
                 "target_id": {"type": "string", "description": "目标QQ号"},
                 "tid": {"type": "string", "description": "说说ID"},
-                "content": {"type": "string", "description": "评论内容（可选，不填则AI自动生成）"}
+                "content": {"type": "string", "description": "评论内容（可选）"}
             },
             "required": ["target_id", "tid"]
         }
@@ -993,7 +934,7 @@ class QzonePlugin(BasePlugin):
     async def tool_comment(self, event: KiraMessageBatchEvent, target_id: str, tid: str, content: str = ""):
         if not await self._check_master(event):
             return "抱歉，只有主人才能使用此功能。"
-
+        await self._ensure_api()
         try:
             if not content:
                 post = QzonePost(uin=int(target_id), tid=tid)
@@ -1011,12 +952,10 @@ class QzonePlugin(BasePlugin):
                     content = await self._call_llm(prompt, self.persona_content)
                     if not content:
                         content = "赞一个！"
-
             post = QzonePost(uin=int(target_id), tid=tid)
             result = await self._comment(post, content)
             return result
         except Exception as e:
-            logger.error(f"评论失败，错误详情: {e}")
             return f"评论失败：{e}"
 
     @register_tool(
@@ -1033,7 +972,7 @@ class QzonePlugin(BasePlugin):
     async def tool_delete(self, event: KiraMessageBatchEvent, tid: str):
         if not await self._check_master(event):
             return "抱歉，只有主人才能使用此功能。"
-
+        await self._ensure_api()
         try:
             result = await self._delete(tid)
             return result
@@ -1049,7 +988,7 @@ class QzonePlugin(BasePlugin):
                 "target_id": {"type": "string", "description": "说说作者的QQ号"},
                 "tid": {"type": "string", "description": "说说ID"},
                 "comment_id": {"type": "string", "description": "要回复的评论ID"},
-                "content": {"type": "string", "description": "回复内容（可选，不填则AI自动生成）"}
+                "content": {"type": "string", "description": "回复内容（可选）"}
             },
             "required": ["target_id", "tid", "comment_id"]
         }
@@ -1057,7 +996,7 @@ class QzonePlugin(BasePlugin):
     async def tool_reply_comment(self, event: KiraMessageBatchEvent, target_id: str, tid: str, comment_id: str, content: str = ""):
         if not await self._check_master(event):
             return "抱歉，只有主人才能使用此功能。"
-
+        await self._ensure_api()
         try:
             post = QzonePost(uin=int(target_id), tid=tid)
             detail_resp = await self.api.get_detail(post)
@@ -1067,7 +1006,6 @@ class QzonePlugin(BasePlugin):
             if not parsed_posts:
                 return f"解析说说详情失败"
             full_post = parsed_posts[0]
-
             target_comment = None
             for cmt in full_post.comments:
                 if str(cmt.tid) == str(comment_id):
@@ -1075,16 +1013,13 @@ class QzonePlugin(BasePlugin):
                     break
             if not target_comment:
                 return f"未找到指定的评论 ID: {comment_id}"
-
             final_content = content
             if not final_content:
                 prompt = f"用户 {target_comment.nickname} 评论了你的说说：{target_comment.content}，请生成一条友好回复（10-30字）。"
                 final_content = await self._call_llm(prompt, self.persona_content)
                 if not final_content:
                     return "生成回复内容为空"
-
             result = await self._reply_comment(post, target_comment, final_content)
             return result
         except Exception as e:
-            logger.error(f"回复失败，错误详情: {e}")
             return f"回复失败：{e}"
