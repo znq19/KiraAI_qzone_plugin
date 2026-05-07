@@ -10,9 +10,9 @@
         "hint": "QQ 适配器名称，不填则自动获取平台类型为 QQ 的适配器"
     },
     "auto_refresh_cookie": {
-        "type": "boolean",
+        "type": "switch",
         "default": true,
-        "hint": "是否启用自动刷新Cookie（通过LLOneBot获取）"
+        "hint": "是否启用自动刷新Cookie（通过OneBot获取）"
     },
     "master_ids": {
         "type": "string",
@@ -45,7 +45,7 @@
         "hint": "自动回复评论定时，格式同上。"
     },
     "auto_reply_enabled": {
-        "type": "boolean",
+        "type": "switch",
         "default": false,
         "hint": "是否开启自动回复评论（需配置auto_reply_schedule）"
     },
@@ -91,7 +91,7 @@
         "hint": "每次自动回复任务最多回复多少条新评论"
     },
     "like_when_comment": {
-        "type": "boolean",
+        "type": "switch",
         "default": false,
         "hint": "自动评论时是否同时点赞"
     }
