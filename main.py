@@ -195,31 +195,43 @@ class QzonePlugin(BasePlugin):
             raise
 
     def _ensure_ada(self):
+        """获取 QQ 适配器实例（兼容新版 KiraAI）"""
         if self._ada_obj:
             return
-        ada_name = None
-        ada = None
-        if self.qq_ada:
-            ada_name = self.qq_ada
+        ada_name = self.qq_ada
+        # 如果配置了名称，直接获取
+        if ada_name:
             ada = self.ctx.adapter_mgr.get_adapter(ada_name)
-        if not ada:
-            ada_infos = self.ctx.adapter_mgr.get_adapter_infos()
-            for info in ada_infos:
-                if info.platform == "QQ":
-                    ada_name = info.name
-            if not ada_name:
-                logger.error("未找到适配器平台为 QQ 的适配器，无法调用 OneBot 接口")
-                return None
-            ada = self.ctx.adapter_mgr.get_adapter(ada_name)
-            if not ada:
-                logger.error(f"未找到 {ada_name} 适配器，无法调用 OneBot 接口")
-                return None
-        self._ada_obj = ada
+            if ada:
+                self._ada_obj = ada
+                return
+            logger.warning(f"未找到配置的适配器: {ada_name}，将自动查找")
+        # 自动查找平台为 QQ 的适配器
+        try:
+            # 新版 KiraAI 可能使用 get_adapters() 返回字典
+            if hasattr(self.ctx.adapter_mgr, 'get_adapters'):
+                adapters = self.ctx.adapter_mgr.get_adapters()
+                for name, ada in adapters.items():
+                    if hasattr(ada, 'info') and ada.info.platform == "QQ":
+                        self._ada_obj = ada
+                        logger.info(f"自动找到 QQ 适配器: {name}")
+                        return
+            # 旧版兼容：尝试私有属性
+            if hasattr(self.ctx.adapter_mgr, '_adapters'):
+                for name, ada in self.ctx.adapter_mgr._adapters.items():
+                    if hasattr(ada, 'info') and ada.info.platform == "QQ":
+                        self._ada_obj = ada
+                        logger.info(f"自动找到 QQ 适配器: {name}")
+                        return
+            logger.error("未找到平台为 QQ 的适配器，无法调用 OneBot 接口")
+        except Exception as e:
+            logger.error(f"查找 QQ 适配器时出错: {e}")
 
     async def _call_onebot_action(self, action: str, params: dict):
         self._ensure_ada()
-        ada = self._ada_obj
-        ob_client = ada.get_client()
+        if not self._ada_obj:
+            raise RuntimeError("无法获取 QQ 适配器")
+        ob_client = self._ada_obj.get_client()
         res = await ob_client.send_action(action, params)
         return res
 
