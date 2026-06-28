@@ -78,7 +78,7 @@
     "auto_publish_image_prob": {
         "type": "float",
         "default": 0.5,
-        "hint": "自动发布时配图的概率（0-1），0表示从不配图，1表示每次都配图"
+        "hint": "自动发布时配图的概率（0-1），0表示从不配图，1表示每次都配图。仅「后台直接生成模式」生效，群聊指令模式由AI自行决定是否配图。"
     },
     "max_comments_per_cycle": {
         "type": "int",
@@ -94,5 +94,16 @@
         "type": "switch",
         "default": false,
         "hint": "自动评论时是否同时点赞"
+    },
+    "backend_llm_model": {
+        "type": "model_select",
+        "model_type": "llm",
+        "default": "",
+        "hint": "「后台直接生成模式」使用的LLM模型。留空则使用默认快速模型。"
+    },
+    "blackout_schedules": {
+        "type": "list",
+        "default": [],
+        "hint": "禁止执行定时任务的时间段列表。格式：'HH:MM-HH:MM'，支持跨天。例如：['22:00-06:00', '12:00-13:00']。仅对定时任务生效，用户主动触发的指令不受此限制。"
     }
 }
