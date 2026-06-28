@@ -66,7 +66,7 @@ class QzonePlugin(BasePlugin):
         self.cfg = cfg
         self.cookies_str = cfg.get("cookies_str", "")
         self.qq_ada = cfg.get("qq_ada", "")
-        self.auto_refresh = cfg.get("auto_refresh_cookie", True)   # 开关：是否强制每次刷新
+        self.auto_refresh = cfg.get("auto_refresh_cookie", True)
         self.timeout = cfg.get("timeout", 10)
         self.temp_dir = Path(cfg.get("temp_dir", "data/temp"))
         self.temp_dir.mkdir(parents=True, exist_ok=True)
@@ -105,7 +105,7 @@ class QzonePlugin(BasePlugin):
         self.auto_comment_cron = cfg.get("auto_comment_cron", "")
         self.auto_reply_cron = cfg.get("auto_reply_cron", "")
 
-        # 解析新配置为触发器字典，供 _setup_scheduled_jobs 使用
+        # 解析新配置为触发器字典
         self.auto_publish_trigger_dict = self._parse_schedule(self.auto_publish_schedule) if self.auto_publish_schedule else None
         self.auto_comment_trigger_dict = self._parse_schedule(self.auto_comment_schedule) if self.auto_comment_schedule else None
         self.auto_reply_trigger_dict = self._parse_schedule(self.auto_reply_schedule) if self.auto_reply_schedule else None
@@ -127,8 +127,14 @@ class QzonePlugin(BasePlugin):
         # QQ适配器对象
         self._ada_obj = None
 
-        # 初始化失败标记（用于首次启动时 oneBot 未就绪）
+        # 初始化失败标记
         self._init_failed = False
+
+        # 新增：后台 LLM 指定（仅后台直接生成模式生效）
+        self.backend_llm_model = cfg.get("backend_llm_model", "")
+
+        # 新增：作息表黑名单（仅定时任务生效，用户主动触发不检查）
+        self.blackout_schedules = cfg.get("blackout_schedules", [])
 
     # ---------- Persona 兼容适配 ----------
     async def _get_persona_content(self) -> str:
@@ -176,7 +182,6 @@ class QzonePlugin(BasePlugin):
             except Exception as e:
                 logger.warning(f"关闭旧 API 时出错: {e}")
         if self.session:
-            # session 没有 close 方法，但 api.close 会关闭 client session
             pass
         try:
             config = type("Config", (), {
@@ -199,16 +204,13 @@ class QzonePlugin(BasePlugin):
         if self._ada_obj:
             return
         ada_name = self.qq_ada
-        # 如果配置了名称，直接获取
         if ada_name:
             ada = self.ctx.adapter_mgr.get_adapter(ada_name)
             if ada:
                 self._ada_obj = ada
                 return
             logger.warning(f"未找到配置的适配器: {ada_name}，将自动查找")
-        # 自动查找平台为 QQ 的适配器
         try:
-            # 新版 KiraAI 可能使用 get_adapters() 返回字典
             if hasattr(self.ctx.adapter_mgr, 'get_adapters'):
                 adapters = self.ctx.adapter_mgr.get_adapters()
                 for name, ada in adapters.items():
@@ -216,7 +218,6 @@ class QzonePlugin(BasePlugin):
                         self._ada_obj = ada
                         logger.info(f"自动找到 QQ 适配器: {name}")
                         return
-            # 旧版兼容：尝试私有属性
             if hasattr(self.ctx.adapter_mgr, '_adapters'):
                 for name, ada in self.ctx.adapter_mgr._adapters.items():
                     if hasattr(ada, 'info') and ada.info.platform == "QQ":
@@ -273,7 +274,6 @@ class QzonePlugin(BasePlugin):
         except Exception as e:
             logger.error(f"初始化 API 失败: {e}")
             if not self.auto_refresh:
-                # 如果未启用自动刷新且初始化失败，则无法工作
                 return
 
         await self._setup_scheduled_jobs()
@@ -289,6 +289,31 @@ class QzonePlugin(BasePlugin):
             executor.shutdown(wait=False)
         except Exception as e:
             logger.error(f"停止QQ空间插件时出错：{e}")
+
+    # ---------- 黑名单检查（仅定时任务） ----------
+    def _is_in_blackout(self) -> bool:
+        """检查当前时间是否在配置的黑名单时间段内（仅定时任务调用）"""
+        if not self.blackout_schedules:
+            return False
+        now = datetime.now().time()
+        for sched in self.blackout_schedules:
+            if not sched or '-' not in sched:
+                continue
+            parts = sched.split('-')
+            try:
+                start_str, end_str = parts[0].strip(), parts[1].strip()
+                start = datetime.strptime(start_str, "%H:%M").time()
+                end = datetime.strptime(end_str, "%H:%M").time()
+                if start <= end:
+                    if start <= now <= end:
+                        return True
+                else:
+                    if now >= start or now <= end:
+                        return True
+            except ValueError:
+                logger.warning(f"无效的黑名单时间段格式: {sched}")
+                continue
+        return False
 
     # ---------- 定时任务 ----------
     async def _setup_scheduled_jobs(self):
@@ -342,7 +367,11 @@ class QzonePlugin(BasePlugin):
         logger.info(f"已向 {target_type} {target_id} 发送指令: {instruction_text[:30]}...")
         return True
 
+    # ---------- 带黑名单检查的定时任务 ----------
     async def _auto_publish_job(self):
+        if self._is_in_blackout():
+            logger.info("当前时间处于黑名单内，跳过自动发布")
+            return
         try:
             if self.last_auto_publish_time and (datetime.now() - self.last_auto_publish_time).total_seconds() < 60:
                 logger.warning("距离上次自动发布不足60秒，跳过本次自动发布")
@@ -395,7 +424,7 @@ class QzonePlugin(BasePlugin):
         else:
             prompt = "请生成一条QQ空间说说，内容可以是心情、日常、段子，20-50字，要符合你的人设。"
 
-        text = await self._call_llm(prompt, system_prompt)
+        text = await self._call_llm(prompt, system_prompt, use_backend_model=True)
         if not text:
             logger.warning("LLM生成内容为空，跳过自动发布")
             return
@@ -417,6 +446,9 @@ class QzonePlugin(BasePlugin):
         logger.info(f"自动发布说说成功: {text} (图片数: {len(image_urls)})")
 
     async def _auto_comment_job(self):
+        if self._is_in_blackout():
+            logger.info("当前时间处于黑名单内，跳过自动评论")
+            return
         try:
             await self._ensure_api()
             if self.task_group_ids or self.task_private_ids:
@@ -435,7 +467,7 @@ class QzonePlugin(BasePlugin):
             selected = random.sample(posts, min(self.max_comments_per_cycle, len(posts)))
             for post in selected:
                 prompt = f"根据以下说说内容，生成一条简短评论（10-20字）：\n{post.text}"
-                comment_text = await self._call_llm(prompt, self.persona_content)
+                comment_text = await self._call_llm(prompt, self.persona_content, use_backend_model=True)
                 if not comment_text:
                     continue
                 await self.api.comment(post, comment_text)
@@ -448,6 +480,9 @@ class QzonePlugin(BasePlugin):
             logger.error(f"自动评论任务失败: {e}")
 
     async def _auto_reply_job(self):
+        if self._is_in_blackout():
+            logger.info("当前时间处于黑名单内，跳过自动回复")
+            return
         try:
             await self._ensure_api()
             if self.task_group_ids or self.task_private_ids:
@@ -482,7 +517,7 @@ class QzonePlugin(BasePlugin):
                     if comment.tid in self.replied_comments:
                         continue
                     prompt = f"用户 {comment.nickname} 评论了你的说说：{comment.content}，请生成一条友好回复（10-30字）。"
-                    reply_text = await self._call_llm(prompt, self.persona_content)
+                    reply_text = await self._call_llm(prompt, self.persona_content, use_backend_model=True)
                     if not reply_text:
                         continue
                     if f"@{comment.nickname}" not in reply_text:
@@ -690,7 +725,7 @@ class QzonePlugin(BasePlugin):
                 break
         return urls
 
-    # ---------- 核心 API 封装（均会先确保 API 可用） ----------
+    # ---------- 核心 API 封装 ----------
     async def _publish(self, text: str, image_urls: list[str]) -> str:
         await self._ensure_api()
         post = QzonePost(text=text, images=image_urls)
@@ -740,7 +775,7 @@ class QzonePlugin(BasePlugin):
         await self._ensure_api()
         if not content:
             prompt = f"用户 {comment.nickname} 评论了你的说说：{comment.content}，请生成一条友好回复（10-30字）。"
-            content = await self._call_llm(prompt, self.persona_content)
+            content = await self._call_llm(prompt, self.persona_content, use_backend_model=False)
             if not content:
                 raise RuntimeError("生成回复内容为空")
         if f"@{comment.nickname}" not in content:
@@ -748,11 +783,19 @@ class QzonePlugin(BasePlugin):
         await self.api.reply(post, comment, content)
         return f"回复成功: {content}"
 
-    async def _call_llm(self, prompt: str, system_prompt: Optional[str] = None) -> str:
+    # ---------- LLM 调用 ----------
+    async def _call_llm(self, prompt: str, system_prompt: Optional[str] = None, use_backend_model: bool = False) -> str:
+        """调用 LLM，use_backend_model=True 时使用后台指定模型（仅后台直接生成模式）"""
         try:
-            client = self.ctx.get_default_llm_client()
+            client = None
+            if use_backend_model and self.backend_llm_model:
+                client = self.ctx.get_llm_client(model_uuid=self.backend_llm_model)
+                if client is None:
+                    logger.warning(f"后台指定模型 {self.backend_llm_model} 不存在，回退到快速模型")
+            if client is None:
+                client = self.ctx.get_default_fast_llm_client()
             if not client:
-                logger.error("无法获取默认 LLM 客户端")
+                logger.error("无法获取 LLM 客户端")
                 return ""
             messages = []
             if system_prompt:
@@ -836,7 +879,7 @@ class QzonePlugin(BasePlugin):
         logger.warning(f"无法解析定时表达式: {s}，任务将被禁用")
         return None
 
-    # ---------- 工具注册 ----------
+    # ---------- 工具注册（不检查黑名单，用户主动触发不受限制） ----------
     @register_tool(
         name="qzone_publish",
         description="发布一条说说到自己的QQ空间。如果用户指定了图片（例如通过引用），你应该提供对应的图片URL；如果用户只说“配图”而不指定具体图片，你可以不提供URL，插件会自动选择最近的一张图片。",
@@ -850,6 +893,7 @@ class QzonePlugin(BasePlugin):
         }
     )
     async def tool_publish(self, event: KiraMessageBatchEvent, text: str, image_urls: list[str] = []):
+        # 不检查黑名单，用户主动触发不受限制
         if not await self._check_master(event):
             return "抱歉，只有主人才能使用此功能。"
         await self._ensure_api()
@@ -878,6 +922,7 @@ class QzonePlugin(BasePlugin):
         }
     )
     async def tool_view(self, event: KiraMessageBatchEvent, target_id: str = None, num: int = 1):
+        # 不检查黑名单，用户主动触发不受限制
         if not await self._check_master(event):
             return "抱歉，只有主人才能使用此功能。"
         await self._ensure_api()
@@ -920,6 +965,7 @@ class QzonePlugin(BasePlugin):
         }
     )
     async def tool_like(self, event: KiraMessageBatchEvent, target_id: str, tid: str):
+        # 不检查黑名单，用户主动触发不受限制
         if not await self._check_master(event):
             return "抱歉，只有主人才能使用此功能。"
         await self._ensure_api()
@@ -944,6 +990,7 @@ class QzonePlugin(BasePlugin):
         }
     )
     async def tool_comment(self, event: KiraMessageBatchEvent, target_id: str, tid: str, content: str = ""):
+        # 不检查黑名单，用户主动触发不受限制
         if not await self._check_master(event):
             return "抱歉，只有主人才能使用此功能。"
         await self._ensure_api()
@@ -956,12 +1003,12 @@ class QzonePlugin(BasePlugin):
                     if parsed_posts:
                         full_post = parsed_posts[0]
                         prompt = f"根据以下说说内容，生成一条简短评论（10-20字）：\n{full_post.text}"
-                        content = await self._call_llm(prompt, self.persona_content)
+                        content = await self._call_llm(prompt, self.persona_content, use_backend_model=False)
                         if not content:
                             content = "赞一个！"
                 else:
                     prompt = f"为这条说说生成一条简短评论（10-20字）"
-                    content = await self._call_llm(prompt, self.persona_content)
+                    content = await self._call_llm(prompt, self.persona_content, use_backend_model=False)
                     if not content:
                         content = "赞一个！"
             post = QzonePost(uin=int(target_id), tid=tid)
@@ -982,6 +1029,7 @@ class QzonePlugin(BasePlugin):
         }
     )
     async def tool_delete(self, event: KiraMessageBatchEvent, tid: str):
+        # 不检查黑名单，用户主动触发不受限制
         if not await self._check_master(event):
             return "抱歉，只有主人才能使用此功能。"
         await self._ensure_api()
@@ -1006,6 +1054,7 @@ class QzonePlugin(BasePlugin):
         }
     )
     async def tool_reply_comment(self, event: KiraMessageBatchEvent, target_id: str, tid: str, comment_id: str, content: str = ""):
+        # 不检查黑名单，用户主动触发不受限制
         if not await self._check_master(event):
             return "抱歉，只有主人才能使用此功能。"
         await self._ensure_api()
@@ -1028,7 +1077,7 @@ class QzonePlugin(BasePlugin):
             final_content = content
             if not final_content:
                 prompt = f"用户 {target_comment.nickname} 评论了你的说说：{target_comment.content}，请生成一条友好回复（10-30字）。"
-                final_content = await self._call_llm(prompt, self.persona_content)
+                final_content = await self._call_llm(prompt, self.persona_content, use_backend_model=False)
                 if not final_content:
                     return "生成回复内容为空"
             result = await self._reply_comment(post, target_comment, final_content)
