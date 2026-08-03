@@ -34,25 +34,33 @@ def remove_em_tags(text):
 class QzoneContext:
     """统一封装 Qzone 请求所需的所有动态参数"""
 
-    def __init__(self, uin: int, skey: str, p_skey: str):
+    def __init__(self, uin: int, skey: str, p_skey: str, cookies: dict[str, str] | None = None):
         self.uin = uin
         self.skey = skey
         self.p_skey = p_skey
+        # 透传完整 Cookie（dolike 等风控严格的写接口要求 p_uin/pt4_token 等字段齐全）
+        jar = dict(cookies or {})
+        jar["uin"] = jar.get("uin") or f"o{uin}"
+        if skey:
+            jar["skey"] = skey
+        if p_skey:
+            jar["p_skey"] = p_skey
+        self._cookies = jar
 
     @property
     def gtk2(self) -> str:
-        """动态计算 gtk2"""
+        """动态计算 gtk2（p_skey 优先，缺失时回退 skey）"""
+        return self._calc_gtk(self.p_skey or self.skey)
+
+    @staticmethod
+    def _calc_gtk(key: str) -> str:
         hash_val = 5381
-        for ch in self.p_skey:
+        for ch in key:
             hash_val += (hash_val << 5) + ord(ch)
         return str(hash_val & 0x7FFFFFFF)
 
     def cookies(self) -> dict[str, str]:
-        return {
-            "uin": f"o{self.uin}",
-            "skey": self.skey,
-            "p_skey": self.p_skey,
-        }
+        return dict(self._cookies)
 
     def headers(self) -> dict[str, str]:
         return {
@@ -241,9 +249,6 @@ class Post(pydantic.BaseModel):
     """评论列表"""
     extra_text: Optional[str] = None
     """额外文本"""
-
-    class Config:
-        json_encoders = {Comment: lambda c: c.model_dump()}
 
     @property
     def show_name(self) -> str:

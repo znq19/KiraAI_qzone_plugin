@@ -1,6 +1,6 @@
 {
     "cookies_str": {
-        "type": "text",
+        "type": "sensitive",
         "default": "",
         "hint": "QQ空间登录Cookie（可选，若启用自动刷新则不需要手动填写）。获取方法：浏览器登录 qzone.qq.com，按F12打开开发者工具，在Network中找到任意请求，复制Cookie字符串。"
     },
@@ -14,10 +14,25 @@
         "default": true,
         "hint": "是否启用自动刷新Cookie（通过OneBot获取）"
     },
+    "cookie_refresh_interval": {
+        "type": "string",
+        "default": "2h",
+        "hint": "Cookie 周期刷新间隔，如 '2h'、'30m'、'7200'（秒）。填 0 或留空则只在启动时和登录失效时刷新。"
+    },
+    "cookie_refresh_on_use": {
+        "type": "string",
+        "default": "10m",
+        "hint": "用即刷节流：调用空间功能时，距上次刷新超过该间隔就顺手刷新一次（如 '10m'、'30m'）。保持 Cookie 新鲜又不会每次调用都打扰 OneBot。填 0 则关闭（完全依赖周期刷新和失效自动救）。"
+    },
     "master_ids": {
         "type": "string",
         "default": "",
         "hint": "主人QQ号，多个用英文逗号分隔。只有这些QQ号才能命令AI使用QQ空间操作性工具（发说说、评论、点赞等）。"
+    },
+    "master_check_enabled": {
+        "type": "switch",
+        "default": false,
+        "hint": "是否启用代码层主人权限检查。默认关闭，不建议开启：开启后非主人会话中 AI 的自主空间行为（自发发说说、点赞等）也会被一并拦截，让她难以自主行动。推荐保持关闭，并在 persona 人设中写明主人规则来约束。查看说说、识图等只读工具本来就不受此限制。"
     },
     "timeout": {
         "type": "int",
@@ -93,7 +108,7 @@
     "like_when_comment": {
         "type": "switch",
         "default": false,
-        "hint": "自动评论时是否同时点赞"
+        "hint": "评论说说后自动顺带点赞（由插件直接执行，AI 无需再调用点赞工具）。群聊指令模式和后台直接生成模式均生效。"
     },
     "backend_llm_model": {
         "type": "model_select",
@@ -101,9 +116,50 @@
         "default": "",
         "hint": "「后台直接生成模式」使用的LLM模型。留空则使用默认快速模型。"
     },
+    "backend_persona": {
+        "type": "persona_select",
+        "default": "",
+        "hint": "「后台直接生成模式」使用的人设。留空则跟随 WebUI 当前激活的人设（切换激活人设即时生效，无需重载插件）。"
+    },
     "blackout_schedules": {
         "type": "list",
         "default": [],
         "hint": "禁止执行定时任务的时间段列表。格式：'HH:MM-HH:MM'，支持跨天。例如：['22:00-06:00', '12:00-13:00']。仅对定时任务生效，用户主动触发的指令不受此限制。"
+    },
+    "image_manifest_enabled": {
+        "type": "switch",
+        "default": true,
+        "hint": "是否向 AI 注入「近期图片清单」（含每张图的内容描述），让她发说说配图时知道图片实际内容。描述复用全局限流缓存，同一张图只识别一次。"
+    },
+    "image_manifest_count": {
+        "type": "int",
+        "default": 5,
+        "hint": "近期图片清单包含的图片数量（每会话）。"
+    },
+    "qzone_image_desc_enabled": {
+        "type": "switch",
+        "default": true,
+        "hint": "是否启用空间说说配图识别（qzone_describe_image 工具）。AI 会根据说说语义自行决定是否识图。"
+    },
+    "qzone_image_desc_own": {
+        "type": "switch",
+        "default": false,
+        "hint": "是否允许 AI 对自己空间的说说调用识图。默认关闭（配图本来就是她自己选的，通常没必要）。"
+    },
+    "auto_comment_image_desc": {
+        "type": "switch",
+        "default": false,
+        "hint": "「后台直接生成模式」的自动评论是否先识别对方说说配图再评论（仅对带图说说生效）。"
+    },
+    "image_desc_model": {
+        "type": "model_select",
+        "model_type": "llm",
+        "default": "",
+        "hint": "图片描述使用的模型。留空则使用默认 VLM 模型。"
+    },
+    "auto_attach_recent_image": {
+        "type": "switch",
+        "default": false,
+        "hint": "吸附模式：发说说未指定图片时，AI会抓最近聊天中的一张图配上，配图概率更大但她不知道图片真正内容；图失效或抓不到时会自动降级为纯文字发布，不会导致发送失败。默认关闭，开启后会取代AI通过近期图片清单知情选图的行为。"
     }
 }

@@ -11,6 +11,27 @@ from .utils import normalize_images
 
 logger = logging.getLogger(__name__)
 
+_MOBILE_UA = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+
+
+def normalize_tid(tid) -> str:
+    """规范化说说 tid：
+    - 剥离 unikey 形式（http://user.qzone.qq.com/123/mood/<tid>）
+    - 剥离 .311 / .1 等 appid 后缀
+    - feeds3 复合 key 取最后一段有效 hex
+    """
+    s = str(tid or "").strip()
+    if not s:
+        return s
+    if "/mood/" in s:
+        s = s.split("/mood/", 1)[1]
+    # 去掉 .311 / .1 后缀
+    if "." in s:
+        head, _, tail = s.rpartition(".")
+        if tail.isdigit() and head:
+            s = head
+    return s
+
 
 class QzoneAPI(QzoneHttpClient):
     """QQ 空间 HTTP API 封装"""
@@ -19,6 +40,8 @@ class QzoneAPI(QzoneHttpClient):
     UPLOAD_IMAGE_URL = "https://up.qzone.qq.com/cgi-bin/upload/cgi_upload_image"
     EMOTION_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_publish_v6"
     DOLIKE_URL = "https://user.qzone.qq.com/proxy/domain/w.qzone.qq.com/cgi-bin/likes/internal_dolike_app"
+    LIKE_V6_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/like_cgi_likev6"
+    MOBILE_LIKE_URL = "https://mobile.qzone.qq.com/like"
     LIST_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qq.com/cgi-bin/emotion_cgi_msglist_v6"
     COMMENT_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_re_feeds"
     ZONE_LIST_URL = "https://user.qzone.qq.com/proxy/domain/ic2.qzone.qq.com/cgi-bin/feeds/feeds3_html_more"
@@ -36,14 +59,26 @@ class QzoneAPI(QzoneHttpClient):
         raw = await self.request(
             "POST",
             self.UPLOAD_IMAGE_URL,
+            params={"g_tk": ctx.gtk2},
             data={
                 "filename": "filename",
                 "uploadtype": "1",
                 "albumtype": "7",
+                "exttype": "0",
+                "refer": "shuoshuo",
                 "skey": ctx.skey,
                 "uin": ctx.uin,
+                "p_uin": ctx.uin,
+                "zzpaneluin": ctx.uin,
+                "zzpanelkey": "",
                 "p_skey": ctx.p_skey,
                 "output_type": "json",
+                "charset": "utf-8",
+                "output_charset": "utf-8",
+                "upload_hd": "1",
+                "hd_width": "2048",
+                "hd_height": "10000",
+                "hd_quality": "96",
                 "base64": "1",
                 "picfile": base64.b64encode(image).decode(),
             },
@@ -53,8 +88,11 @@ class QzoneAPI(QzoneHttpClient):
             },
             timeout=60,
         )
-        logger.debug(raw)
-        return ApiResponse.from_raw(raw, code_key="ret", msg_key="msg")
+        resp = ApiResponse.from_raw(raw, code_key="ret", msg_key="msg")
+        if not resp.ok:
+            # 记录原始响应便于诊断（截断防爆日志）
+            logger.warning(f"图片上传失败原始响应: {str(raw)[:500]}")
+        return resp
 
     async def get_visitor(self) -> ApiResponse:
         """获取访客数"""
@@ -73,8 +111,12 @@ class QzoneAPI(QzoneHttpClient):
         )
         return ApiResponse.from_raw(raw)
 
-    async def publish(self, post: Post) -> ApiResponse:
-        """发表说说, 返回tid"""
+    async def publish(self, post: Post, allow_image_drop: bool = False) -> ApiResponse:
+        """发表说说, 返回tid
+
+        allow_image_drop=True 时（吸附兑底/后台自动等场景），
+        配图全部获取失败会降级为纯文字发布而不是整个失败。
+        """
         ctx = await self.session.get_ctx()
         data: dict[str, Any] = {
             "syn_tweet_verson": "1",
@@ -90,10 +132,23 @@ class QzoneAPI(QzoneHttpClient):
             "format": "json",
             "qzreferrer": f"{self.BASE_URL}/{ctx.uin}",
         }
+        download_errors: list[str] = []
         if post.images:
             logger.debug(f"正在上传图片: {post.images}")
             pic_bos, richvals = [], []
-            imgs: list[bytes] = await normalize_images(post.images)
+            imgs: list[bytes] = await normalize_images(post.images, errors=download_errors)
+            if not imgs:
+                if allow_image_drop:
+                    logger.warning(
+                        f"配图全部获取失败，降级为纯文字发布: {'; '.join(download_errors)}"
+                    )
+                    download_errors = ["配图获取失败（链接可能已过期），已降级为纯文字"]
+                else:
+                    raise RuntimeError(
+                        f"所有图片均获取失败（共 {len(post.images)} 张）: {'; '.join(download_errors) or '原因未知'}"
+                    )
+            elif download_errors:
+                logger.warning(f"部分图片获取失败: {'; '.join(download_errors)}")
             for img in imgs:
                 resp = await self._upload_image(img)
                 if not resp.ok:
@@ -101,11 +156,12 @@ class QzoneAPI(QzoneHttpClient):
                 picbo, richval = QzoneParser.parse_upload_result(resp.data)
                 pic_bos.append(picbo)
                 richvals.append(richval)
-            data.update(
-                pic_bo=",".join(pic_bos),
-                richtype="1",
-                richval="\t".join(richvals),
-            )
+            if pic_bos:
+                data.update(
+                    pic_bo=",".join(pic_bos),
+                    richtype="1",
+                    richval="\t".join(richvals),
+                )
 
         raw = await self.request(
             "POST",
@@ -113,35 +169,125 @@ class QzoneAPI(QzoneHttpClient):
             params={"g_tk": ctx.gtk2, "uin": ctx.uin},
             data=data,
         )
-        return ApiResponse.from_raw(raw)
+        resp = ApiResponse.from_raw(raw)
+        # 部分图片失败时把原因捎带给调用方（不影响发布结果）
+        if resp.ok and download_errors:
+            resp.message = "; ".join(download_errors)
+        return resp
 
-    async def like(self, post: Post) -> ApiResponse:
+    async def like(
+        self,
+        post: Post,
+        abstime: int | None = None,
+        appid: int = 311,
+        typeid: int = 0,
+    ) -> ApiResponse:
         """
-        点赞指定说说
+        点赞指定说说（三级降级，参考 onebot-qzone 实机验证实现）：
+        1. internal_dolike_app（w.qzone.qq.com）
+        2. like_cgi_likev6（taotao.qzone.qq.com）
+        3. mobile.qzone.qq.com/like
+        abstime 应为说说的发布时间（不是当前时间），缺失时回退当前时间。
         """
         ctx = await self.session.get_ctx()
-        raw = await self.request(
-            "POST",
-            self.DOLIKE_URL,
-            params={
-                "g_tk": ctx.gtk2,
-            },
-            data={
-                "qzreferrer": f"{self.BASE_URL}/{ctx.uin}",
-                "opuin": ctx.uin,
-                "unikey": f"{self.BASE_URL}/{post.uin}/mood/{post.tid}",
-                "curkey": f"{self.BASE_URL}/{post.uin}/mood/{post.tid}",
-                "appid": 311,
-                "from": 1,
-                "typeid": 0,
-                "abstime": int(time.time()),
-                "fid": post.tid,
-                "active": 0,
-                "format": "json",
-                "fupdate": 1,
-            },
+        tid = normalize_tid(post.tid)
+        abstime = int(abstime or getattr(post, "create_time", 0) or time.time())
+        if appid == 311:
+            unikey = f"http://user.qzone.qq.com/{post.uin}/mood/{tid}"
+        else:
+            unikey = f"http://user.qzone.qq.com/{post.uin}/app/{tid}"
+        qzreferrer = f"{self.BASE_URL}/{ctx.uin}/main"
+        errors: list[str] = []
+
+        # 方法1: internal_dolike_app
+        try:
+            raw1 = await self.request(
+                "POST",
+                self.DOLIKE_URL,
+                params={"g_tk": ctx.gtk2},
+                data={
+                    "qzreferrer": qzreferrer,
+                    "opuin": ctx.uin,
+                    "unikey": unikey,
+                    "curkey": unikey,
+                    "appid": appid,
+                    "typeid": typeid,
+                    "fid": tid,
+                    "from": 1,
+                    "active": 0,
+                    "fupdate": 1,
+                    "abstime": abstime,
+                    "format": "json",
+                },
+            )
+            if raw1.get("ret") == 0 or raw1.get("code") == 0:
+                raw1["code"] = 0
+                return ApiResponse.from_raw(raw1)
+            errors.append(f"dolike: code={raw1.get('code')} msg={raw1.get('message') or raw1.get('msg')}")
+        except Exception as e:
+            errors.append(f"dolike: {e}")
+
+        # 方法2: like_cgi_likev6
+        try:
+            raw2 = await self.request(
+                "POST",
+                self.LIKE_V6_URL,
+                params={"g_tk": ctx.gtk2},
+                data={
+                    "opuin": ctx.uin,
+                    "ouin": post.uin,
+                    "fid": tid,
+                    "abstime": abstime,
+                    "appid": appid,
+                    "typeid": typeid,
+                    "key": "",
+                    "format": "json",
+                    "qzreferrer": qzreferrer,
+                },
+            )
+            if raw2.get("ret") == 0 or raw2.get("code") == 0:
+                raw2["code"] = 0
+                return ApiResponse.from_raw(raw2)
+            errors.append(f"likev6: code={raw2.get('code')} msg={raw2.get('message') or raw2.get('msg')}")
+        except Exception as e:
+            errors.append(f"likev6: {e}")
+
+        # 方法3: mobile like（兜底）
+        try:
+            raw3 = await self.request(
+                "POST",
+                self.MOBILE_LIKE_URL,
+                params={"g_tk": ctx.gtk2},
+                data={
+                    "unikey": unikey,
+                    "curkey": unikey,
+                    "appid": appid,
+                    "typeid": typeid,
+                    "active": 0,
+                    "fupdate": 1,
+                },
+                headers={
+                    "User-Agent": _MOBILE_UA,
+                    "Referer": "https://mobile.qzone.qq.com",
+                    "Accept": "application/json, text/plain, */*",
+                    "X-Requested-With": "XMLHttpRequest",
+                },
+            )
+            if raw3.get("ret") == 0 or raw3.get("code") == 0:
+                raw3["code"] = 0
+                return ApiResponse.from_raw(raw3)
+            errors.append(f"mobile: code={raw3.get('code')} msg={raw3.get('message') or raw3.get('msg')}")
+        except Exception as e:
+            errors.append(f"mobile: {e}")
+
+        logger.warning(f"点赞三级降级全部失败: {' | '.join(errors)}")
+        return ApiResponse(
+            ok=False,
+            code=-1,
+            message="; ".join(errors) or "点赞失败",
+            data={},
+            raw={},
         )
-        return ApiResponse.from_raw(raw)
 
     async def comment(self, post: Post, content: str) -> ApiResponse:
         """

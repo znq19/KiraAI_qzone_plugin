@@ -199,7 +199,8 @@ class QzoneParser:
                 # 读取视频封面（按图片处理）
                 for video in msg.get("video") or []:
                     video_image_url = video.get("url1") or video.get("pic_url")
-                    image_urls.append(video_image_url)
+                    if video_image_url:
+                        image_urls.append(video_image_url)
                 # 提取视频播放地址
                 video_urls = []
                 for video in msg.get("video") or []:
@@ -258,6 +259,11 @@ class QzoneParser:
                     logger.error(f"无效的说说数据: target_qq={uin}, tid={tid}")
                     continue
                 create_time = feed.get("abstime", "")
+                # abstime 可能为空或字符串，统一转 int
+                try:
+                    create_time = int(create_time)
+                except (TypeError, ValueError):
+                    create_time = 0
                 nickname = feed.get("nickname", "")
                 html_content = feed.get("html", "")
                 if not html_content:

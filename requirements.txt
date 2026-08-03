@@ -3,4 +3,3 @@ aiofiles
 apscheduler
 beautifulsoup4
 json5
-httpx
