@@ -1488,6 +1488,8 @@ class QzonePlugin(BasePlugin):
                 parsed_posts = QzoneParser.parse_feeds([raw])
                 if parsed_posts:
                     post = parsed_posts[0]
+                    if not post.uin:
+                        post.uin = int(target_id)
             result = await self._like(post)
             return result
         except Exception as e:
@@ -1545,6 +1547,9 @@ class QzonePlugin(BasePlugin):
                             parsed_posts = QzoneParser.parse_feeds([raw])
                             if parsed_posts:
                                 like_post = parsed_posts[0]
+                    # 防御：详情解析缺失 uin 时回填作者 QQ，防止点赞 unikey 拼错
+                    if not like_post.uin:
+                        like_post.uin = int(target_id)
                     like_resp = await self.api.like(like_post, abstime=like_post.create_time)
                     if like_resp.ok:
                         result += "，已同时点赞"
