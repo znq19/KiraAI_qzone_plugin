@@ -547,8 +547,12 @@ class QzonePlugin(BasePlugin):
         self._user_name_cache[user_id] = (name, time.time())
         return name
 
-    async def _send_task_instruction(self, instruction_text: str) -> bool:
-        """发送定时任务指令（合成内部事件，带 qzone_task 标记供 silent 模式识别）"""
+    async def _send_task_instruction(self, instruction_text: str, with_place: bool = True) -> bool:
+        """发送定时任务指令（合成内部事件，带 qzone_task 标记供 silent 模式识别）
+
+        with_place=False 用于评论/回复任务：操作对象是空间说说，与会话场合无关，
+        附加场合信息反而会误导 AI。
+        """
         targets = []
         for gid in self.task_group_ids:
             targets.append(("gm", gid))
@@ -564,15 +568,16 @@ class QzonePlugin(BasePlugin):
             return False
 
         session_type, target_id = random.choice(targets)
-        # 补充场合信息，避免 AI 搞错任务发生的会话
-        if session_type == "gm":
-            group_name = await self._get_group_name(target_id)
-            place = f"群「{group_name}」{target_id}" if group_name else f"群 {target_id}"
-            instruction_text += f"\n（当前场合：{place}）"
-        else:
-            nickname = await self._get_user_nickname(target_id)
-            place = f"与「{nickname}」{target_id} 的私聊" if nickname else f"与 {target_id} 的私聊"
-            instruction_text += f"\n（当前场合：{place}）"
+        # 补充场合信息，避免 AI 搞错任务发生的会话（评论/回复任务不附加）
+        if with_place:
+            if session_type == "gm":
+                group_name = await self._get_group_name(target_id)
+                place = f"群「{group_name}」{target_id}" if group_name else f"群 {target_id}"
+                instruction_text += f"\n（当前场合：{place}）"
+            else:
+                nickname = await self._get_user_nickname(target_id)
+                place = f"与「{nickname}」{target_id} 的私聊" if nickname else f"与 {target_id} 的私聊"
+                instruction_text += f"\n（当前场合：{place}）"
 
         adapter = self._ada_obj
         adapter_name = adapter.info.name
@@ -730,7 +735,7 @@ class QzonePlugin(BasePlugin):
             await self._ensure_api()
             if self.task_group_ids or self.task_private_ids:
                 instruction = "【评论任务】请对最近的好友（不包括自己）说说进行评论，自然一点。严禁内容重复和复读。注意，检查用户昵称来不要评论自己发布的QQ说说，优先没有评论过的内容，该内容时间戳与当前系统时间戳不得超过7天，否则不评论。"
-                await self._send_task_instruction(instruction)
+                await self._send_task_instruction(instruction, with_place=False)
                 return
             await self._legacy_auto_comment()
         except Exception as e:
@@ -776,7 +781,7 @@ class QzonePlugin(BasePlugin):
             await self._ensure_api()
             if self.task_group_ids or self.task_private_ids:
                 instruction = "【回复任务】请回复你最近说说下的新评论，开头必须qzone_reply_comment(target_id, tid, comment_id, content)，target_id为自己的QQ号，自然一点，严禁内容重复和复读。检测comment_id来不回复自己。优先没有回复过的用户和新回复，否则不回复。"
-                await self._send_task_instruction(instruction)
+                await self._send_task_instruction(instruction, with_place=False)
                 return
             await self._legacy_auto_reply()
         except Exception as e:
