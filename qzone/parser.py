@@ -107,12 +107,14 @@ class QzoneParser:
         return picbo, richval
 
     @staticmethod
-    def parse_visitors(data: dict[str, Any]) -> str:
+    def parse_visitors(data: dict[str, Any], max_items: int = 20) -> str:
         data = data.get("data") or {}
         items = data.get("items")
 
         if not isinstance(items, list) or not items:
             return "### 最近来访明细\n\n暂无访客记录"
+        max_items = max(1, int(max_items or 20))
+        items = items[:max_items]
 
         src_map: dict[int, str] = {
             0: "访问空间",

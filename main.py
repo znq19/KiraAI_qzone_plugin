@@ -72,7 +72,13 @@ class QzonePlugin(BasePlugin):
         # 后台模式数据源
         self.auto_publish_group_id = cfg.get("auto_publish_group_id", "")
         self.auto_publish_user_id = cfg.get("auto_publish_user_id", "")
-        self.auto_publish_image_prob = cfg.get("auto_publish_image_prob", 0.5)
+        self.auto_publish_image_prob = self._clamp_float(cfg.get("auto_publish_image_prob", 1.0), 0.0, 1.0)
+        self.auto_publish_image_min = max(0, int(cfg.get("auto_publish_image_min", 0) or 0))
+        self.auto_publish_image_max = max(self.auto_publish_image_min, int(cfg.get("auto_publish_image_max", 3) or 3))
+        self.auto_publish_image_fallback = bool(cfg.get("auto_publish_image_fallback", False))
+        self.auto_publish_image_dedupe_interval = self._parse_interval_seconds(
+            cfg.get("auto_publish_image_dedupe_interval", "3d"), default_unit="h"
+        )
 
         self.session: Optional[QzoneSession] = None
         self.api: Optional[QzoneAPI] = None
@@ -107,6 +113,7 @@ class QzonePlugin(BasePlugin):
         # 图片识图相关配置
         self.image_manifest_enabled = cfg.get("image_manifest_enabled", True)
         self.image_manifest_count = max(1, int(cfg.get("image_manifest_count", 5) or 5))
+        self.visitor_limit = max(1, min(50, int(cfg.get("visitor_limit", 20) or 20)))
         self.qzone_image_desc_enabled = cfg.get("qzone_image_desc_enabled", True)
         self.auto_comment_image_desc = cfg.get("auto_comment_image_desc", False)
         self.image_desc_model = cfg.get("image_desc_model", "")
@@ -147,6 +154,8 @@ class QzonePlugin(BasePlugin):
         self._describing: set[int] = set()
         # 空间图片 url -> md5 映射（避免重复下载）
         self._url_md5: dict[str, str] = {}
+        # 主动发布成功使用过的图片指纹及时间，仅在发布成功后写入。
+        self._published_image_history: list[dict] = []
 
     # ---------- 状态持久化 ----------
     def _state_path(self) -> Path:
@@ -160,6 +169,11 @@ class QzonePlugin(BasePlugin):
             data = json.loads(path.read_text(encoding="utf-8"))
             self.replied_comments = set(data.get("replied_comments", [])[-MAX_REPLIED_CACHE:])
             self.my_posts_history = list(data.get("my_posts_history", [])[-MAX_HISTORY:])
+            self._published_image_history = [
+                {"identity": item.get("identity") or item.get("source", ""), "time": item.get("time", 0)}
+                for item in data.get("published_image_history", [])[-IMAGE_REGISTRY_CAP:]
+                if item.get("identity") or item.get("source")
+            ]
             logger.info(f"已加载持久化状态：历史说说 {len(self.my_posts_history)} 条，已回复评论 {len(self.replied_comments)} 条")
         except Exception as e:
             logger.warning(f"加载插件状态失败: {e}")
@@ -171,12 +185,19 @@ class QzonePlugin(BasePlugin):
             data = {
                 "replied_comments": list(self.replied_comments)[-MAX_REPLIED_CACHE:],
                 "my_posts_history": self.my_posts_history[-MAX_HISTORY:],
+                "published_image_history": self._published_image_history[-IMAGE_REGISTRY_CAP:],
             }
             path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
         except Exception as e:
             logger.warning(f"保存插件状态失败: {e}")
 
-    # ---------- Persona 获取（每次实时读取，跟随 WebUI 切换） ----------
+    @staticmethod
+    def _clamp_float(value, minimum: float, maximum: float) -> float:
+        try:
+            return max(minimum, min(maximum, float(value)))
+        except (TypeError, ValueError):
+            return minimum
+
     async def _get_persona_content(self) -> str:
         """获取人设内容：配置 backend_persona 时用指定人设（id 或名称均可），否则用当前激活人设"""
         try:
@@ -328,25 +349,21 @@ class QzonePlugin(BasePlugin):
             return
 
     @staticmethod
-    def _parse_interval_seconds(s) -> Optional[int]:
-        """解析 '6h' / '30m' / '7200' 等间隔；空或 0 返回 None（禁用）"""
+    def _parse_interval_seconds(s, default_unit: str = "m") -> Optional[int]:
+        """解析 3d/6h/30m/7200 等间隔；空或 0 返回 None。"""
         if s is None:
             return None
         s = str(s).strip().lower()
-        if not s or s in ("0", "0s", "0m", "0h"):
+        if not s or s in ("0", "0s", "0m", "0h", "0d"):
             return None
-        m = re.match(r"^(\d+(?:\.\d+)?)([hms]?)$", s)
+        m = re.match(r"^(\d+(?:\.\d+)?)([dhms]?)$", s)
         if not m:
-            logger.warning(f"无法解析 Cookie 刷新间隔: {s}，使用默认 6h")
-            return 6 * 3600
+            logger.warning(f"无法解析间隔: {s}")
+            return None
         val = float(m.group(1))
-        unit = m.group(2)
-        if unit == "h":
-            val *= 3600
-        elif unit == "s":
-            pass
-        else:  # 默认按分钟
-            val *= 60
+        unit = m.group(2) or default_unit
+        multipliers = {"d": 86400, "h": 3600, "m": 60, "s": 1}
+        val *= multipliers[unit]
         return int(val) if val > 0 else None
 
     def _ensure_ada(self):
@@ -605,6 +622,13 @@ class QzonePlugin(BasePlugin):
             session_type=session_type,
             session_id=target_id,
         )
+        if with_place and self.image_manifest_enabled and not self.auto_attach_recent_image:
+            try:
+                await self._fetch_history_messages(
+                    "group" if session_type == "gm" else "private", target_id, 20
+                )
+            except Exception as e:
+                logger.debug(f"预取定时任务图片候选失败: {e}")
         await self.ctx.message_processor.handle_im_message(event)
         logger.info(f"已向 {sid} 发送指令: {instruction_text[:30]}...")
         return True
@@ -636,9 +660,8 @@ class QzonePlugin(BasePlugin):
             if self.task_group_ids or self.task_private_ids:
                 instruction = (
                     "【定时任务】请根据最近聊天发布一条说说，自然一点，不要提及这是定时任务。"
-                    "配图根据内容随机决定配 1 张或多张："
-                    "用 images 参数传聊天记录里见过的图片 URL 或本地路径，"
-                    "或用 image_indices 参数引用[近期图片]清单中的序号。"
+                    "根据[近期图片]清单和内容决定是否配图；配图时用image_indices选择"
+                    f"{self.auto_publish_image_min}至{self.auto_publish_image_max}张，也可用images传聊天记录里见过的图片URL或本地路径。"
                 )
                 if await self._send_task_instruction(instruction):
                     self.last_auto_publish_time = datetime.now()
@@ -679,31 +702,31 @@ class QzonePlugin(BasePlugin):
         else:
             prompt = "请生成一条QQ空间说说，内容可以是心情、日常、段子，20-50字，要符合你的人设。"
 
-        # 提前获取候选图及描述，让 LLM 知情选图
         image_urls: list[str] = []
         if source_id and self.auto_publish_image_prob > 0 and random.random() < self.auto_publish_image_prob:
-            candidates = await self._fetch_recent_images(source_type, source_id, max_count=3)
-            if candidates:
-                desc_lines = []
-                for i, url in enumerate(candidates, 1):
-                    desc = await self._describe_image_url(url)
-                    if desc:
-                        desc_lines.append(f"{i}. {desc}")
-                    else:
-                        desc_lines.append(f"{i}. （内容未知）")
+            candidates = await self._fetch_recent_images(source_type, source_id, max_count=self.auto_publish_image_max)
+            candidates = [url for url in candidates if not self._is_recently_published_image(url)]
+            described = []
+            for url in candidates:
+                desc = await self._describe_image_url(url)
+                if desc:
+                    described.append((url, desc))
+            if described:
                 prompt += (
-                    "\n\n以下是最近聊天中出现的图片及内容描述：\n" + "\n".join(desc_lines) +
-                    "\n如果你认为说说适合配图，请在正文后另起一行输出 IMG:序号（如 IMG:1），否则不要输出 IMG 行。"
+                    "\n\n以下是最近聊天中出现的图片及内容描述：\n"
+                    + "\n".join(f"{i}. {desc}" for i, (_, desc) in enumerate(described, 1))
+                    + f"\n如果适合配图，在正文后另起一行输出 IMG:序号 或 IMG:序号,序号，最多{self.auto_publish_image_max}张；否则不要输出 IMG 行。"
                 )
                 text_with_choice = await self._call_llm(prompt, system_prompt, use_backend_model=True)
-                text, chosen = self._split_img_choice(text_with_choice)
-                if chosen is not None and 1 <= chosen <= len(candidates):
-                    image_urls = [candidates[chosen - 1]]
-                    logger.info(f"后台发布选用第 {chosen} 张图")
+                text, chosen = self._split_img_choices(text_with_choice)
+                valid = [described[i - 1][0] for i in chosen if 1 <= i <= len(described)]
+                if len(valid) != len(chosen):
+                    valid = [] if not self.auto_publish_image_fallback else [url for url, _ in described[:self.auto_publish_image_min]]
+                if not chosen and self.auto_publish_image_min > 0:
+                    valid = [url for url, _ in described[:self.auto_publish_image_min]]
+                image_urls = valid[:self.auto_publish_image_max]
             else:
-                logger.info("未找到图片，将只发布文字")
-                text_with_choice = await self._call_llm(prompt, system_prompt, use_backend_model=True)
-                text, _ = self._split_img_choice(text_with_choice)
+                text = await self._call_llm(prompt, system_prompt, use_backend_model=True)
         else:
             text = await self._call_llm(prompt, system_prompt, use_backend_model=True)
 
@@ -716,16 +739,24 @@ class QzonePlugin(BasePlugin):
         logger.info(f"自动发布说说成功: {text} (图片数: {len(image_urls)})")
 
     @staticmethod
-    def _split_img_choice(text: str) -> tuple[str, Optional[int]]:
-        """解析 LLM 输出末尾的 IMG:序号 行"""
+    def _split_img_choices(text: str) -> tuple[str, list[int]]:
+        """解析末尾 IMG:1 或 IMG:1,3 选择行。"""
         if not text:
-            return "", None
-        m = re.search(r"^\s*IMG\s*[:：]\s*(\d+)\s*$", text, re.M)
-        if not m:
-            return text.strip(), None
-        chosen = int(m.group(1))
-        cleaned = re.sub(r"^\s*IMG\s*[:：]\s*\d+\s*$", "", text, flags=re.M).strip()
+            return "", []
+        matches = re.findall(r"^\s*IMG\s*[:：]\s*([\d\s,，]+)\s*$", text, re.M | re.I)
+        if not matches:
+            return text.strip(), []
+        chosen = []
+        for part in re.split(r"[,，\s]+", matches[-1].strip()):
+            if part.isdigit():
+                chosen.append(int(part))
+        cleaned = re.sub(r"^\s*IMG\s*[:：]\s*[\d\s,，]+\s*$", "", text, flags=re.M | re.I).strip()
         return cleaned, chosen
+
+    @staticmethod
+    def _split_img_choice(text: str) -> tuple[str, Optional[int]]:
+        cleaned, choices = QzonePlugin._split_img_choices(text)
+        return cleaned, (choices[0] if choices else None)
 
     async def _auto_comment_job(self):
         if self._is_in_blackout():
@@ -761,8 +792,12 @@ class QzonePlugin(BasePlugin):
                 comment_text = await self._call_llm(prompt, await self._get_persona_content(), use_backend_model=True)
                 if not comment_text:
                     continue
-                await self.api.comment(post, comment_text)
-                logger.info(f"自动评论成功: {post.tid} -> {comment_text}")
+                try:
+                    await self._comment(post, comment_text)
+                    logger.info(f"自动评论成功并已确认落地: {post.tid} -> {comment_text}")
+                except Exception as e:
+                    logger.warning(f"自动评论失败或未落地: {post.tid} -> {e}")
+                    continue
                 if self.like_when_comment:
                     like_resp = await self.api.like(post, abstime=post.create_time)
                     if like_resp.ok:
@@ -780,7 +815,7 @@ class QzonePlugin(BasePlugin):
         try:
             await self._ensure_api()
             if self.task_group_ids or self.task_private_ids:
-                instruction = "【回复任务】请回复你最近说说下的新评论，开头必须qzone_reply_comment(target_id, tid, comment_id, content)，target_id为自己的QQ号，自然一点，严禁内容重复和复读。检测comment_id来不回复自己。优先没有回复过的用户和新回复，否则不回复。"
+                instruction = "【回复任务】请回复你最近说说下的新评论，使用qzone_reply_comment和评论自身的ID、UIN准确回复，target_id为自己的QQ号。自然一点，严禁内容重复和复读。根据评论作者UIN不回复自己，优先没有回复过的用户和新回复，否则不回复。"
                 await self._send_task_instruction(instruction, with_place=False)
                 return
             await self._legacy_auto_reply()
@@ -808,17 +843,21 @@ class QzonePlugin(BasePlugin):
                 for comment in full_post.comments:
                     if comment.uin == self.my_uin:
                         continue
-                    if comment.tid in self.replied_comments:
+                    reply_key = f"{full_post.tid}:{comment.tid}:{comment.uin}"
+                    if reply_key in self.replied_comments:
                         continue
-                    prompt = f"用户 {comment.nickname} 评论了你的说说：{comment.content}，请生成一条友好回复（10-30字）。"
+                    _, prompt_content = self._parse_comment_content(comment.content)
+                    prompt = f"用户 {comment.nickname} 评论了你的说说：{prompt_content}，请生成一条友好回复（10-30字）。"
                     reply_text = await self._call_llm(prompt, await self._get_persona_content(), use_backend_model=True)
                     if not reply_text:
                         continue
-                    if f"@{comment.nickname}" not in reply_text:
-                        reply_text = f"回复 @{comment.nickname}：{reply_text}"
-                    await self.api.reply(full_post, comment, reply_text)
-                    logger.info(f"自动回复成功: {comment.tid} -> {reply_text}")
-                    self.replied_comments.add(comment.tid)
+                    root_comment = self._find_root_comment(full_post.comments, comment)
+                    resp = await self.api.reply(full_post, comment, reply_text, root_comment=root_comment)
+                    if not resp.ok:
+                        logger.warning(f"自动回复失败: {comment.tid}/{comment.uin} -> {resp.message}")
+                        continue
+                    logger.info(f"自动回复成功: {comment.tid}/{comment.uin} -> {reply_text}")
+                    self.replied_comments.add(reply_key)
                     self._save_state()
                     new_replies += 1
                     if new_replies >= self.max_replies_per_cycle:
@@ -829,47 +868,72 @@ class QzonePlugin(BasePlugin):
         except Exception as e:
             logger.error(f"自动回复任务失败: {e}")
 
-    # ---------- 历史与图片获取辅助 ----------
-    async def _fetch_chat_history(self, source_type: str, source_id: str, count: int = 10) -> List[str]:
-        """获取群/私聊最近消息文本"""
-        if source_type == "group":
-            action, params = "get_group_msg_history", {"group_id": int(source_id), "count": count}
-        else:
-            action, params = "get_friend_msg_history", {"user_id": int(source_id), "count": count}
-        result = await self._call_onebot_action(action, params)
+    async def _register_current_event_images(self, event: KiraMessageBatchEvent):
+        if not self.image_manifest_enabled or self.auto_attach_recent_image:
+            return
+        sid = getattr(event, "sid", "")
+        if not sid:
+            return
+        registry = self._image_registry.setdefault(sid, [])
+        for message in getattr(event, "messages", None) or []:
+            sender = ""
+            if message.sender:
+                sender = message.sender.nickname or str(message.sender.user_id or "未知")
+            for elem in getattr(message, "chain", []) or []:
+                if not isinstance(elem, Image):
+                    continue
+                if any(e.get("elem") is elem for e in registry):
+                    continue
+                registry.append({"elem": elem, "sender": sender,
+                                 "time": int(getattr(message, "timestamp", 0) or time.time()),
+                                 "desc": getattr(elem, "caption", None),
+                                 "msg_id": getattr(message, "message_id", None)})
+        if len(registry) > IMAGE_REGISTRY_CAP:
+            del registry[: len(registry) - IMAGE_REGISTRY_CAP]
+
+        action = "get_group_msg_history" if source_type == "group" else "get_friend_msg_history"
+        key = "group_id" if source_type == "group" else "user_id"
+        result = await self._call_onebot_action(action, {key: int(source_id), "count": count})
         if not result or result.get("status") != "ok":
-            logger.error(f"获取{'群' if source_type == 'group' else '私聊'}历史失败: {result}")
+            logger.error(f"获取历史失败: {result}")
             return []
-        messages = result.get("data", {}).get("messages", [])
-        if not messages:
-            return []
-        summaries = []
-        for msg in messages[-count:]:
-            sender = msg.get("sender", {}).get("nickname", "未知")
-            content = self._extract_text_simple(msg.get("message", []))
-            summaries.append(f"{sender}: {content}")
-        return summaries
+        messages = result.get("data", {}).get("messages", []) or []
+        if self.image_manifest_enabled and not self.auto_attach_recent_image:
+            sid = f"qq:{'gm' if source_type == 'group' else 'dm'}:{source_id}"
+            registry = self._image_registry.setdefault(sid, [])
+            for msg in messages:
+                sender_data = msg.get("sender") or {}
+                sender = sender_data.get("nickname") or str(sender_data.get("user_id") or "未知")
+                msg_id = msg.get("message_id")
+                timestamp = int(msg.get("time") or time.time())
+                for seg in msg.get("message") or []:
+                    if seg.get("type") != "image":
+                        continue
+                    data = seg.get("data") or {}
+                    url = html.unescape(str(data.get("url") or "").strip().strip('"').strip("'"))
+                    if url and not any(e.get("url") == url for e in registry):
+                        registry.append({"source": "url", "url": url, "sender": sender,
+                                         "time": timestamp, "desc": None, "msg_id": msg_id})
+            if len(registry) > IMAGE_REGISTRY_CAP:
+                del registry[: len(registry) - IMAGE_REGISTRY_CAP]
+        return messages[-count:]
+
+    async def _fetch_chat_history(self, source_type: str, source_id: str, count: int = 10) -> List[str]:
+        messages = await self._fetch_history_messages(source_type, source_id, max(count, 20))
+        return [
+            f"{msg.get('sender', {}).get('nickname', '未知')}: {self._extract_text_simple(msg.get('message', []))}"
+            for msg in messages[-count:]
+        ]
 
     async def _fetch_recent_images(self, source_type: str, source_id: str, max_count: int = 1) -> List[str]:
-        """从群/私聊历史获取最近图片 URL（新图优先）"""
-        if source_type == "group":
-            action, params = "get_group_msg_history", {"group_id": int(source_id), "count": 20}
-        else:
-            action, params = "get_friend_msg_history", {"user_id": int(source_id), "count": 20}
-        result = await self._call_onebot_action(action, params)
-        if not result or result.get("status") != "ok":
-            logger.error(f"oneBot返回错误: {result}")
-            return []
-        messages = result.get("data", {}).get("messages", [])
-        if not messages:
-            return []
+        """从历史登记候选并返回最新图片 URL（兼容吸附模式）。"""
+        messages = await self._fetch_history_messages(source_type, source_id, 20)
         urls = []
         for msg in reversed(messages):
-            for seg in msg.get("message", []):
+            for seg in msg.get("message") or []:
                 if seg.get("type") == "image":
-                    url = seg.get("data", {}).get("url", "")
+                    url = html.unescape(str((seg.get("data") or {}).get("url") or "").strip().strip('"').strip("'"))
                     if url:
-                        url = html.unescape(url.strip().strip('"').strip("'"))
                         urls.append(url)
                         if len(urls) >= max_count:
                             return urls
@@ -1017,9 +1081,14 @@ class QzonePlugin(BasePlugin):
         return registry[-self.image_manifest_count:]
 
     async def _resolve_entry_desc(self, entry: dict) -> str:
-        """解析单张图片的描述：elem.caption -> md5 缓存 -> 后台描述"""
+        """解析图片描述，兼容实时 Image 与历史 URL 候选。"""
         if entry.get("desc"):
             return entry["desc"]
+        if entry.get("source") == "url":
+            desc = await self._describe_image_url(entry.get("url", ""))
+            if desc:
+                entry["desc"] = desc
+            return desc
         elem: Image = entry["elem"]
         if elem.caption:
             entry["desc"] = elem.caption
@@ -1068,6 +1137,7 @@ class QzonePlugin(BasePlugin):
             sid = getattr(event, "sid", "")
             if not sid:
                 return
+            await self._register_current_event_images(event)
             entries = self._manifest_entries(sid)
             if not entries:
                 return
@@ -1082,8 +1152,7 @@ class QzonePlugin(BasePlugin):
             if not lines:
                 return
             text = (
-                "[近期图片] 本群/会话最近出现的图片及内容描述，"
-                "调用 qzone_publish 发说说时可用 image_indices 参数引用序号配图：\n"
+                "[近期图片] 本群/会话最近出现的图片及内容描述，调用 qzone_publish 发说说时可用 image_indices 参数引用序号配图：\n"
                 + "\n".join(lines)
             )
             req.user_prompt.insert(0, Prompt(
@@ -1118,44 +1187,79 @@ class QzonePlugin(BasePlugin):
         return False
 
     async def _resolve_manifest_images(self, sid: str, indices: list) -> List[str]:
-        """按清单序号解析图片为本地路径（供发布使用），过期 URL 自动续命一次"""
+        """按清单序号解析图片；历史 URL 直接传入，实时 Image 转成本地路径。"""
         paths = []
         entries = self._manifest_entries(sid)
-        for idx in indices:
-            try:
-                i = int(idx)
-            except (TypeError, ValueError):
-                continue
-            if not (1 <= i <= len(entries)):
-                continue
-            entry = entries[i - 1]
-            elem: Image = entry["elem"]
-            for attempt in range(2):
+        try:
+            normalized_indices = []
+            for idx in indices:
                 try:
-                    path = await elem.to_path()
-                    if path:
-                        # 校验内容真的是图片（缓存文件可能是过期时下载的错误页）
-                        with open(path, 'rb') as f:
-                            head = f.read(16)
-                        if looks_like_image(head):
-                            paths.append(str(path))
-                            break
-                        logger.warning(f"清单图片 {i} 缓存内容不是图片: {path}")
-                    raise ValueError("to_path 为空或内容非图片")
-                except Exception as e:
-                    if attempt == 0 and await self._refresh_image_url(entry):
-                        continue  # 续命成功，重试一次
-                    logger.warning(f"清单图片 {i} 获取失败: {e}")
-                    break
-        return paths
+                    normalized_indices.append(int(idx))
+                except (TypeError, ValueError):
+                    return []
+            if not normalized_indices:
+                return []
+            if any(not (1 <= i <= len(entries)) for i in normalized_indices):
+                return []
+            for i in dict.fromkeys(normalized_indices):
+                entry = entries[i - 1]
+                if entry.get("source") == "url":
+                    url = entry.get("url", "")
+                    if url:
+                        paths.append(url)
+                    continue
+                elem: Image = entry["elem"]
+                for attempt in range(2):
+                    try:
+                        path = await elem.to_path()
+                        if path:
+                            with open(path, "rb") as f:
+                                head = f.read(16)
+                            if looks_like_image(head):
+                                paths.append(str(path))
+                                break
+                            logger.warning(f"清单图片 {i} 缓存内容不是图片: {path}")
+                        raise ValueError("to_path 为空或内容非图片")
+                    except Exception as e:
+                        if attempt == 0 and await self._refresh_image_url(entry):
+                            continue
+                        logger.warning(f"清单图片 {i} 获取失败: {e}")
+                        break
+            return paths
+        finally:
+            pass
 
     # ---------- 核心 API 封装 ----------
+    def _image_identity(self, source: str) -> str:
+        return self._url_md5.get(source, source)
+
+    def _is_recently_published_image(self, source: str) -> bool:
+        identity = self._image_identity(source)
+        interval = self.auto_publish_image_dedupe_interval
+        if not interval:
+            return False
+        now = time.time()
+        return any(
+            item.get("identity") == identity and now - float(item.get("time", 0)) < interval
+            for item in self._published_image_history
+        )
+
+    def _record_published_images(self, sources: list[str]):
+
+        now = int(time.time())
+        for source in sources:
+            self._published_image_history.append({"identity": self._image_identity(source), "time": now})
+        self._published_image_history = self._published_image_history[-IMAGE_REGISTRY_CAP:]
+        self._save_state()
+
     async def _publish(self, text: str, image_urls: list, allow_image_drop: bool = False) -> str:
         await self._ensure_api()
         post = QzonePost(text=text, images=image_urls)
         resp = await self.api.publish(post, allow_image_drop=allow_image_drop)
         if not resp.ok:
             raise RuntimeError(f"发布失败: {resp.message}")
+        if image_urls and not (allow_image_drop and resp.message):
+            self._record_published_images([str(x) for x in image_urls])
         tid = resp.data.get("tid")
         result = f"说说发布成功！TID: {tid}"
         if resp.message:
@@ -1184,12 +1288,68 @@ class QzonePlugin(BasePlugin):
             raise RuntimeError(f"点赞失败: {resp.message}")
         return "点赞成功"
 
+    @staticmethod
+    def _normalize_comment_text(content: str) -> str:
+        """用于落地确认；忽略 QQ 展示层插入的空白，但保留实际字符差异。"""
+        return re.sub(r"\s+", "", content or "")
+
+    def _count_own_comment(self, post: QzonePost, content: str) -> int:
+        expected = self._normalize_comment_text(content)
+        if not expected:
+            return 0
+        return sum(
+            1
+            for comment in post.comments
+            if str(comment.uin) == str(self.my_uin)
+            and self._normalize_comment_text(comment.plain_content) == expected
+        )
+
+    async def _get_detail_post(self, post: QzonePost) -> QzonePost:
+        detail_resp = await self.api.get_detail(post)
+        if not detail_resp.ok:
+            raise RuntimeError(f"获取说说详情失败: {detail_resp.message}")
+        parsed_posts = QzoneParser.parse_feeds([detail_resp.data])
+        if not parsed_posts:
+            raise RuntimeError("说说详情解析失败")
+        return parsed_posts[0]
+
     async def _comment(self, post: QzonePost, content: str) -> str:
+        """提交评论并回读确认；只有确认新增评论后才能报告成功或继续点赞。"""
         await self._ensure_api()
+        if not self.my_uin:
+            raise RuntimeError("无法确认当前登录 QQ，已取消评论")
+
+        before_post = await self._get_detail_post(post)
+        before_count = self._count_own_comment(before_post, content)
+
         resp = await self.api.comment(post, content)
         if not resp.ok:
-            raise RuntimeError(f"评论失败: {resp.message}")
-        return "评论成功"
+            raise RuntimeError(f"评论接口失败: {resp.message}")
+
+        last_error = ""
+        for delay in (0, 1, 2, 4):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                current_post = await self._get_detail_post(post)
+                current_count = self._count_own_comment(current_post, content)
+                if current_count > before_count:
+                    logger.info(
+                        "QZone评论落地确认: post=%s own_uin=%s before=%s after=%s",
+                        post.tid,
+                        self.my_uin,
+                        before_count,
+                        current_count,
+                    )
+                    return "评论成功（已确认落地）"
+                last_error = f"匹配评论数未增加（{before_count}->{current_count}）"
+            except Exception as e:
+                last_error = str(e)
+
+        raise RuntimeError(
+            "评论接口返回成功，但详情回读未发现新增评论；"
+            f"不会执行自动点赞。{last_error}"
+        )
 
     async def _delete(self, tid: str) -> str:
         await self._ensure_api()
@@ -1198,16 +1358,38 @@ class QzonePlugin(BasePlugin):
             raise RuntimeError(f"删除失败: {resp.message}")
         return f"说说 {tid} 删除成功"
 
-    async def _reply_comment(self, post: QzonePost, comment: QzoneComment, content: str = "") -> str:
+    @staticmethod
+    def _find_root_comment(comments: List[QzoneComment], comment: QzoneComment) -> QzoneComment:
+        """返回 API 所需的主评论对象，避免把主评论 ID 与回复作者 UIN 错配。"""
+        if comment.parent_tid is None:
+            return comment
+        roots = [
+            item for item in comments
+            if item.parent_tid is None and str(item.tid) == str(comment.parent_tid)
+        ]
+        if len(roots) != 1:
+            raise RuntimeError(
+                f"无法唯一定位楼中回复 {comment.tid}/{comment.uin} 的主评论 {comment.parent_tid}"
+            )
+        return roots[0]
+
+    async def _reply_comment(
+        self,
+        post: QzonePost,
+        comment: QzoneComment,
+        content: str = "",
+        root_comment: Optional[QzoneComment] = None,
+    ) -> str:
         await self._ensure_api()
         if not content:
-            prompt = f"用户 {comment.nickname} 评论了你的说说：{comment.content}，请生成一条友好回复（10-30字）。"
+            _, prompt_content = self._parse_comment_content(comment.content)
+            prompt = f"用户 {comment.nickname} 评论了你的说说：{prompt_content}，请生成一条友好回复（10-30字）。"
             content = await self._call_llm(prompt, await self._get_persona_content(), use_backend_model=False)
             if not content:
                 raise RuntimeError("生成回复内容为空")
-        if f"@{comment.nickname}" not in content:
-            content = f"回复 @{comment.nickname}：{content}"
-        await self.api.reply(post, comment, content)
+        resp = await self.api.reply(post, comment, content, root_comment=root_comment)
+        if not resp.ok:
+            raise RuntimeError(f"回复失败: {resp.message}")
         return f"回复成功: {content}"
 
     # ---------- LLM 调用 ----------
@@ -1260,6 +1442,25 @@ class QzonePlugin(BasePlugin):
                 return True
         logger.warning(f"用户 {senders} 尝试使用QQ空间敏感工具，但不在主人列表中")
         return False
+
+    @staticmethod
+    def _parse_comment_content(content: str) -> tuple[str, str]:
+        """拆分 QQ 空间原生回复对象标记和正文。"""
+        text = content or ""
+        match = re.match(r"\s*@\{uin:(\d+),nick:([^,}]+)[^}]*\}\s*", text)
+        if not match:
+            return "", text
+        target = f"{match.group(2)}(UIN:{match.group(1)})"
+        return target, text[match.end():]
+
+    @classmethod
+    def _format_comment_line(cls, comment: QzoneComment, label: str, indent: str, time_str: str) -> str:
+        target, content = cls._parse_comment_content(comment.content)
+        relation = f" 回复 {target}" if target else ""
+        return (
+            f"{indent}└ [{label} ID:{comment.tid} UIN:{comment.uin}] "
+            f"{comment.nickname}{relation} [{time_str}]: {content}"
+        )
 
     def _add_post_to_history(self, text: str):
         self.my_posts_history.append(text)
@@ -1409,11 +1610,35 @@ class QzonePlugin(BasePlugin):
                         line += f"\n配图x{img_count}"
                 if p.comments:
                     comment_lines = []
-                    for i, cmt in enumerate(p.comments[:5]):
-                        cmt_time_str = cmt.create_time_str if hasattr(cmt, 'create_time_str') and cmt.create_time_str else self._format_time(cmt.create_time)
-                        comment_lines.append(f"  └ {cmt.nickname} (ID:{cmt.tid}) [{cmt_time_str}]: {cmt.content}")
+                    replies_by_parent: dict[int, list[QzoneComment]] = {}
+                    main_comments = []
+                    for cmt in p.comments:
+                        if cmt.parent_tid is None:
+                            main_comments.append(cmt)
+                        else:
+                            replies_by_parent.setdefault(cmt.parent_tid, []).append(cmt)
+
+                    shown_comments: set[int] = set()
+                    for cmt in main_comments:
+                        cmt_time_str = cmt.create_time_str or self._format_time(cmt.create_time)
+                        comment_lines.append(self._format_comment_line(cmt, "主评论", "  ", cmt_time_str))
+                        shown_comments.add(id(cmt))
+                        for reply in replies_by_parent.get(cmt.tid, []):
+                            reply_time_str = reply.create_time_str or self._format_time(reply.create_time)
+                            comment_lines.append(self._format_comment_line(reply, "楼中回复", "    ", reply_time_str))
+                            shown_comments.add(id(reply))
+
+                    # 防御性展示没有匹配主评论的回复；不递归推断不存在的更深层级。
+                    for cmt in p.comments:
+                        if id(cmt) in shown_comments:
+                            continue
+                        cmt_time_str = cmt.create_time_str or self._format_time(cmt.create_time)
+                        label = "主评论" if cmt.parent_tid is None else "楼中回复"
+                        indent = "  " if cmt.parent_tid is None else "    "
+                        comment_lines.append(self._format_comment_line(cmt, label, indent, cmt_time_str))
+                        shown_comments.add(id(cmt))
                     if comment_lines:
-                        line += "\n评论区：\n" + "\n".join(comment_lines)
+                        line += "\n评论区：\n" + "\n".join(comment_lines[:20])
                 lines.append(line)
             return "\n---\n".join(lines)
         except Exception as e:
@@ -1463,6 +1688,29 @@ class QzonePlugin(BasePlugin):
             return f"第{index}张图片内容（共{len(full_post.images)}张）：{desc}"
         except Exception as e:
             return f"识别失败：{e}"
+
+    @register_tool(
+        name="qzone_visitors",
+        description="查看自己QQ空间最近访客和访客统计。返回最近访客明细、来源、隐身/黄钻状态，以及今日和最近30天访客数。仅支持查看当前登录账号自己的空间。",
+        params={
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
+    )
+    async def tool_visitors(self, event: KiraMessageBatchEvent):
+        """查询当前登录账号的 QQ 空间访客统计。"""
+        if not await self._check_master(event):
+            return "抱歉，只有主人才能使用此功能。"
+        await self._ensure_api()
+        try:
+            resp = await self.api.get_visitor()
+            if not resp.ok:
+                return f"获取访客失败：{resp.message or resp.code}"
+            return QzoneParser.parse_visitors(resp.raw, self.visitor_limit)
+        except Exception as e:
+            logger.exception("获取访客统计失败")
+            return f"获取访客失败：{e}"
 
     @register_tool(
         name="qzone_like",
@@ -1590,19 +1838,20 @@ class QzonePlugin(BasePlugin):
 
     @register_tool(
         name="qzone_reply_comment",
-        description="回复指定评论（可自动生成内容）。评论ID可以从 qzone_view 的输出中获取（格式：└ 昵称 (ID:xxx) [时间]: 内容）。",
+        description="回复指定评论。先从 qzone_view 获取评论 ID 和 UIN；当同一说说内 ID 重复时必须同时传 comment_uin，避免回复错人。",
         params={
             "type": "object",
             "properties": {
                 "target_id": {"type": "string", "description": "说说作者的QQ号"},
                 "tid": {"type": "string", "description": "说说ID"},
                 "comment_id": {"type": "string", "description": "要回复的评论ID"},
+                "comment_uin": {"type": "string", "description": "评论作者QQ号；同一说说内评论ID重复时必填"},
                 "content": {"type": "string", "description": "回复内容（可选）"}
             },
             "required": ["target_id", "tid", "comment_id"]
         }
     )
-    async def tool_reply_comment(self, event: KiraMessageBatchEvent, target_id: str, tid: str, comment_id: str, content: str = ""):
+    async def tool_reply_comment(self, event: KiraMessageBatchEvent, target_id: str, tid: str, comment_id: str, comment_uin: str = "", content: str = ""):
         # 不检查黑名单，用户主动触发不受限制
         if not await self._check_master(event):
             return "抱歉，只有主人才能使用此功能。"
@@ -1616,20 +1865,30 @@ class QzonePlugin(BasePlugin):
             if not parsed_posts:
                 return "解析说说详情失败"
             full_post = parsed_posts[0]
-            target_comment = None
-            for cmt in full_post.comments:
-                if str(cmt.tid) == str(comment_id):
-                    target_comment = cmt
-                    break
-            if not target_comment:
-                return f"未找到指定的评论 ID: {comment_id}"
+            matches = [cmt for cmt in full_post.comments if str(cmt.tid) == str(comment_id)]
+            if comment_uin:
+                matches = [cmt for cmt in matches if str(cmt.uin) == str(comment_uin)]
+            if not matches:
+                suffix = f"、UIN: {comment_uin}" if comment_uin else ""
+                return f"未找到指定的评论 ID: {comment_id}{suffix}"
+            if len(matches) > 1:
+                options = "，".join(f"{cmt.nickname}(UIN:{cmt.uin})" for cmt in matches)
+                return f"评论 ID {comment_id} 不唯一，请补充 comment_uin。可选目标：{options}"
+            target_comment = matches[0]
             final_content = content
             if not final_content:
-                prompt = f"用户 {target_comment.nickname} 评论了你的说说：{target_comment.content}，请生成一条友好回复（10-30字）。"
+                _, prompt_content = self._parse_comment_content(target_comment.content)
+                prompt = f"用户 {target_comment.nickname} 评论了你的说说：{prompt_content}，请生成一条友好回复（10-30字）。"
                 final_content = await self._call_llm(prompt, await self._get_persona_content(), use_backend_model=False)
                 if not final_content:
                     return "生成回复内容为空"
-            result = await self._reply_comment(post, target_comment, final_content)
+            root_comment = self._find_root_comment(full_post.comments, target_comment)
+            result = await self._reply_comment(
+                post,
+                target_comment,
+                final_content,
+                root_comment=root_comment,
+            )
             return result
         except Exception as e:
             return f"回复失败：{e}"

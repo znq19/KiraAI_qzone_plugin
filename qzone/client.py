@@ -76,6 +76,7 @@ class QzoneHttpClient:
         timeout: int | None = None,
         retry: int = 0,
         empty_retry: int = 0,
+        empty_retry_limit: int = 4,
     ) -> dict:
         ctx = await self.session.get_ctx()
         async with self._session.request(
@@ -98,13 +99,20 @@ class QzoneHttpClient:
 
         # 服务端偶发空响应（QZone 常见抽风），独立重试额度，最多 4 次
         # 递增退避：1s/2s/3s/4s（刚刷新完 Cookie 后服务端有短暂热身窗口）
-        if parsed.get("message") == QZONE_MSG_EMPTY_RESPONSE and empty_retry < 4:
+        if (
+            parsed.get("message") == QZONE_MSG_EMPTY_RESPONSE
+            and empty_retry < empty_retry_limit
+        ):
             wait = empty_retry + 1
-            logger.warning(f"响应内容为空，{wait}秒后重试({empty_retry + 1}/4): {url}")
+            logger.warning(
+                f"响应内容为空，{wait}秒后重试"
+                f"({empty_retry + 1}/{empty_retry_limit}): {url}"
+            )
             await asyncio.sleep(wait)
             return await self.request(
                 method, url, params=params, data=data,
                 headers=headers, retry=retry, empty_retry=empty_retry + 1,
+                empty_retry_limit=empty_retry_limit,
             )
 
         if self._is_auth_failure(resp.status, parsed):
@@ -131,6 +139,7 @@ class QzoneHttpClient:
                             method, url, params=params, data=data,
                             headers=headers, retry=retry + 2,
                             empty_retry=empty_retry,
+                            empty_retry_limit=empty_retry_limit,
                         )
                     except Exception:
                         pass
@@ -145,6 +154,7 @@ class QzoneHttpClient:
                 headers=headers,
                 retry=retry + 1,
                 empty_retry=empty_retry,
+                empty_retry_limit=empty_retry_limit,
             )
 
         if resp.status == HTTP_STATUS_FORBIDDEN and parsed.get("code") in (

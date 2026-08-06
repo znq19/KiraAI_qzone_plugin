@@ -44,6 +44,7 @@ class QzoneAPI(QzoneHttpClient):
     MOBILE_LIKE_URL = "https://mobile.qzone.qq.com/like"
     LIST_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qq.com/cgi-bin/emotion_cgi_msglist_v6"
     COMMENT_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_re_feeds"
+    COMMENT_H5_URL = "https://h5.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_re_feeds"
     ZONE_LIST_URL = "https://user.qzone.qq.com/proxy/domain/ic2.qzone.qq.com/cgi-bin/feeds/feeds3_html_more"
     VISITOR_URL = "https://h5.qzone.qq.com/proxy/domain/g.qzone.qq.com/cgi-bin/friendshow/cgi_get_visitor_more"
     REPLY_URL = "https://h5.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_re_feeds"
@@ -95,7 +96,7 @@ class QzoneAPI(QzoneHttpClient):
         return resp
 
     async def get_visitor(self) -> ApiResponse:
-        """获取访客数"""
+        """获取最近访客和统计，不清除访客提示状态。"""
         ctx = await self.session.get_ctx()
         raw = await self.request(
             "GET",
@@ -104,12 +105,30 @@ class QzoneAPI(QzoneHttpClient):
                 "uin": ctx.uin,
                 "mask": 7,
                 "g_tk": ctx.gtk2,
+                "format": "json",
                 "page": 1,
                 "fupdate": 1,
-                "clear": 1,
+                "clear": 0,
             },
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+                "Referer": f"{self.BASE_URL}/{ctx.uin}",
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "X-Requested-With": "XMLHttpRequest",
+            },
+            empty_retry_limit=1,
         )
-        return ApiResponse.from_raw(raw)
+        resp = ApiResponse.from_raw(raw)
+        if resp.ok:
+            logger.info("QZone访客接口成功")
+        else:
+            logger.warning(
+                "QZone访客接口失败: code=%s message=%s raw=%s",
+                resp.code,
+                resp.message,
+                str(raw)[:500],
+            )
+        return resp
 
     async def publish(self, post: Post, allow_image_drop: bool = False) -> ApiResponse:
         """发表说说, 返回tid
@@ -290,13 +309,41 @@ class QzoneAPI(QzoneHttpClient):
         )
 
     async def comment(self, post: Post, content: str) -> ApiResponse:
-        """
-        评论指定说说
-        """
+        """评论指定说说，优先使用 user JSON 路径，失败后回退 H5 表单路径。"""
         ctx = await self.session.get_ctx()
-        raw = await self.request(
+        qzreferrer = f"https://user.qzone.qq.com/{post.uin}/main"
+
+        raw_user = await self.request(
             "POST",
             self.COMMENT_URL,
+            params={"g_tk": ctx.gtk2},
+            data={
+                "hostUin": post.uin,
+                "topicId": f"{post.uin}_{post.tid}",
+                "content": content,
+                "format": "json",
+                "qzreferrer": qzreferrer,
+            },
+        )
+        user_resp = ApiResponse.from_raw(raw_user)
+        if user_resp.ok:
+            logger.info(
+                "QZone评论接口成功: route=user post=%s code=%s",
+                post.tid,
+                user_resp.code,
+            )
+            return user_resp
+
+        logger.warning(
+            "QZone评论 user 路径失败，回退 H5: post=%s code=%s message=%s raw=%s",
+            post.tid,
+            user_resp.code,
+            user_resp.message,
+            str(raw_user)[:500],
+        )
+        raw_h5 = await self.request(
+            "POST",
+            self.COMMENT_H5_URL,
             params={"g_tk": ctx.gtk2},
             data={
                 "topicId": f"{post.uin}_{post.tid}__1",
@@ -307,22 +354,82 @@ class QzoneAPI(QzoneHttpClient):
                 "outCharset": "utf-8",
                 "plat": "qzone",
                 "source": "ic",
-                "platformid": 52,
+                "isSignIn": "",
+                "platformid": 50,
                 "format": "fs",
                 "ref": "feeds",
                 "content": content,
+                "richval": "",
+                "richtype": "",
+                "private": "0",
+                "paramstr": "1",
+                "qzreferrer": qzreferrer,
+            },
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+                "Referer": qzreferrer,
+                "Origin": "https://user.qzone.qq.com",
             },
         )
-        return ApiResponse.from_raw(raw)
+        h5_resp = ApiResponse.from_raw(raw_h5)
+        if h5_resp.ok:
+            logger.info(
+                "QZone评论接口成功: route=h5 post=%s code=%s",
+                post.tid,
+                h5_resp.code,
+            )
+            return h5_resp
+
+        logger.warning(
+            "QZone评论两条路径均失败: post=%s user=%s/%s h5=%s/%s raw=%s",
+            post.tid,
+            user_resp.code,
+            user_resp.message,
+            h5_resp.code,
+            h5_resp.message,
+            str(raw_h5)[:500],
+        )
+        return ApiResponse(
+            ok=False,
+            code=h5_resp.code,
+            message=(
+                f"user: {user_resp.message or user_resp.code}; "
+                f"h5: {h5_resp.message or h5_resp.code}"
+            ),
+            data={},
+            raw={"user": raw_user, "h5": raw_h5},
+        )
 
     async def reply(
         self,
         post: Post,
         comment: Comment,
         content: str,
+        root_comment: Comment | None = None,
     ) -> ApiResponse:
-        """回复指定评论"""
+        """回复评论；API 锚定主评论，楼中回复目标写入 QQ 原生关系标记。"""
         ctx = await self.session.get_ctx()
+        root = root_comment or comment
+        if comment.parent_tid is not None and root.tid != comment.parent_tid:
+            raise ValueError(
+                f"楼中回复所属主评论不匹配: target={comment.tid} "
+                f"parent={comment.parent_tid} root={root.tid}"
+            )
+
+        reply_content = content
+        if comment.parent_tid is not None:
+            reply_content = f"@{{uin:{comment.uin},nick:{comment.nickname},who:1,auto:1}}{content}"
+
+        logger.info(
+            "QZone回复参数: post=%s target_comment=%s root_comment=%s "
+            "root_uin=%s target_uin=%s native_target=%s",
+            post.tid,
+            comment.tid,
+            root.tid,
+            root.uin,
+            comment.uin,
+            comment.parent_tid is not None,
+        )
         raw = await self.request(
             "POST",
             self.REPLY_URL,
@@ -341,9 +448,9 @@ class QzoneAPI(QzoneHttpClient):
                 "platformid": 52,
                 "format": "fs",
                 "ref": "feeds",
-                "content": content,
-                "commentId": comment.tid,
-                "commentUin": comment.uin,
+                "content": reply_content,
+                "commentId": root.tid,
+                "commentUin": root.uin,
                 "richval": "",
                 "richtype": "",
                 "private": "0",
@@ -361,7 +468,15 @@ class QzoneAPI(QzoneHttpClient):
                 "Origin": "https://user.qzone.qq.com",
             },
         )
-        return ApiResponse.from_raw(raw)
+        resp = ApiResponse.from_raw(raw)
+        if not resp.ok:
+            logger.warning(
+                "QZone回复失败原始响应: code=%s message=%s raw=%s",
+                resp.code,
+                resp.message,
+                str(raw)[:1000],
+            )
+        return resp
 
     async def delete(self, tid: str) -> ApiResponse:
         """删除指定说说"""

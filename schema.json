@@ -17,7 +17,7 @@
     "cookie_refresh_interval": {
         "type": "string",
         "default": "2h",
-        "hint": "Cookie 周期刷新间隔，如 '2h'、'30m'、'7200'（秒）。填 0 或留空则只在启动时和登录失效时刷新。"
+        "hint": "Cookie 周期刷新间隔，如 2h、30m、7200。填 0 或留空则只在启动时和登录失效时刷新。"
     },
     "cookie_refresh_on_use": {
         "type": "string",
@@ -92,8 +92,28 @@
     },
     "auto_publish_image_prob": {
         "type": "float",
-        "default": 0.5,
-        "hint": "自动发布时配图的概率（0-1），0表示从不配图，1表示每次都配图。仅「后台直接生成模式」生效，群聊指令模式由AI自行决定是否配图。"
+        "default": 1.0,
+        "hint": "主动发布进入配图候选流程的概率（0-1）。"
+    },
+    "auto_publish_image_min": {
+        "type": "int",
+        "default": 0,
+        "hint": "主动发布最少图片数。0表示允许纯文字，但仍会展示候选清单。"
+    },
+    "auto_publish_image_max": {
+        "type": "int",
+        "default": 3,
+        "hint": "主动发布最多图片数。"
+    },
+    "auto_publish_image_fallback": {
+        "type": "switch",
+        "default": false,
+        "hint": "AI返回非法图片选择时是否从候选图兜底；关闭时发布纯文字。"
+    },
+    "auto_publish_image_dedupe_interval": {
+        "type": "string",
+        "default": "3d",
+        "hint": "主动发布图片去重间隔，如 3d、72h、12h、0。仅发布成功后记录。"
     },
     "max_comments_per_cycle": {
         "type": "int",
@@ -125,6 +145,11 @@
         "type": "list",
         "default": [],
         "hint": "禁止执行定时任务的时间段列表。格式：'HH:MM-HH:MM'，支持跨天。例如：['22:00-06:00', '12:00-13:00']。仅对定时任务生效，用户主动触发的指令不受此限制。"
+    },
+    "visitor_limit": {
+        "type": "int",
+        "default": 20,
+        "hint": "访客统计最多返回的最近访客条数（1-50）。统计数字仍按QQ空间接口返回的今日/最近30天总数展示。"
     },
     "image_manifest_enabled": {
         "type": "switch",

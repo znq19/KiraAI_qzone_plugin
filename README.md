@@ -1,4 +1,4 @@
-# QQ空间助手插件安装使用教程（小白版） v1.41
+# QQ空间助手插件安装使用教程（小白版） v1.42
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_qzone_plugin)
 
@@ -17,6 +17,7 @@
 - ✅ **自动配图（可识图）**：AI 能看到聊天中图片的内容描述（复用 KiraAI 核心的图片描述缓存，同一张图只识别一次），发说说时可按内容知情选图；后台直接生成模式发说说时也会先识别候选图再决定是否配图。
 - ✅ **空间识图**：看别人空间时，如果说说有配图，AI 可根据说说语义自行调用 `qzone_describe_image` 识别图片内容后再评论/点赞，更真实。
 - ✅ **点赞已修复（三级降级）**：点赞接口采用 `internal_dolike_app → like_cgi_likev6 → mobile like` 三级降级重试，并使用完整 Cookie 与正确的发布时间参数，点赞成功率大幅提升。
+- ✅ **访客统计**：可通过 `qzone_visitors` 查看最近访客明细、来源、隐身/黄钻状态，以及今日和最近30天访客数。
 - ✅ **全自动 Cookie 管理（四层混合机制）**：用即刷（调用时距上次刷新超 10 分钟顺手刷）+ 周期刷新（默认 2 小时）+ 登录失效自动刷新重试 + 抽风延迟重试。Cookie 始终新鲜，偶发抽风自动自愈，不拖累 OneBot 连接。
 - ✅ **仅需 WebSocket**：不再依赖 OneBot HTTP 服务，只需 WebSocket 连接即可正常工作（KiraAI 默认）。
 - ✅ **兼容 LLOneBot 与 NapCat**：代码已合并通用部分，适配器名称正确即可自动适应。
@@ -91,7 +92,7 @@ pip install apscheduler beautifulsoup4 json5 aiohttp
 
 插件的大部分配置项都可以在 WebUI 中直接修改。访问 `http://127.0.0.1:5267`，进入插件管理页面，找到“QQ空间助手”，点击“配置”。
 
-以下是各配置项的含义（基于 v1.40）：
+以下是各配置项的含义（基于 v1.42）：
 
 | 配置项 | 类型 | 必填 | 说明 |
 |--------|------|------|------|
@@ -113,15 +114,20 @@ pip install apscheduler beautifulsoup4 json5 aiohttp
 | `task_message_style` | enum | 否 | 通用任务消息样式：`silent`=AI 静默执行任务，群里完全看不到她的回复（真无痕，推荐）；`notify`=保留 AI 的回复消息。 |
 | `auto_publish_group_id` | string | 否 | **后台直接生成模式**：用于获取聊天话题和图片的群号（仅当未配置任何任务目标时生效）。 |
 | `auto_publish_user_id` | string | 否 | **后台直接生成模式**：用于获取聊天话题和图片的个人QQ号（仅当未配置任何任务目标且未配置群号时生效）。 |
-| `auto_publish_image_prob` | float | 否 | **仅后台直接生成模式有效**：自动发布时配图的概率（0-1），0表示从不配图，1表示每次都配图。群聊指令模式下由 AI 自行决定是否配图。 |
+| `auto_publish_image_prob` | float | 否 | 主动发布进入配图候选流程的概率（0-1），默认 1。进入后会把近期图片清单提供给 AI。 |
+| `auto_publish_image_min` | int | 否 | 主动发布最少图片数，默认 0。0 表示允许纯文字，但不会隐藏图片候选清单。 |
+| `auto_publish_image_max` | int | 否 | 主动发布最多图片数，默认 3。 |
+| `auto_publish_image_fallback` | switch | 否 | AI 返回非法图片选择时是否兜底选图，默认关闭；关闭时发布纯文字。 |
+| `auto_publish_image_dedupe_interval` | string | 否 | 主动发布图片去重间隔，如 `3d`、`72h`、`12h`、`0`；只在图片发布成功后记录。 |
 | `backend_llm_model` | model_select | 否 | **仅后台直接生成模式有效**：后台定时任务使用的 LLM 模型。留空则使用默认快速模型。群聊指令模式下 AI 使用的是 KiraAI 主流程的默认模型。 |
 | `backend_persona` | persona_select | 否 | **仅后台直接生成模式有效**：后台任务使用的人设。留空则跟随 WebUI 当前激活的人设（切换即时生效）。群聊指令模式下 AI 使用主流程人设。 |
 | `blackout_schedules` | list | 否 | **仅定时任务有效**：禁止执行定时任务的时间段列表。格式：`HH:MM-HH:MM`，支持跨天。例如：`['22:00-06:00', '12:00-13:00']`。用户主动触发的指令不受此限制。 |
 | `max_comments_per_cycle` | int | 否 | 每次自动评论最多评论多少条说说（后台模式有效，指令模式下由AI自主决定）。 |
 | `max_replies_per_cycle` | int | 否 | 每次自动回复最多处理多少条新评论（后台模式有效）。 |
 | `like_when_comment` | boolean | 否 | 评论说说后自动顺带点赞（插件直接执行，AI 无需再调点赞工具），默认false。群聊指令模式和后台直接生成模式均生效。 |
+| `visitor_limit` | int | 否 | 访客统计最多返回的最近访客明细条数，默认 20，可设置 1-50；今日和最近30天统计数字不受影响。 |
 | `image_manifest_enabled` | switch | 否 | 是否向 AI 注入「近期图片清单」（含每张图的内容描述），默认开启。开启后她发说说配图时知道图片实际内容，可按序号选图。 |
-| `image_manifest_count` | int | 否 | 近期图片清单包含的图片数量（每会话），默认 5。 |
+| `image_manifest_count` | int | 否 | 近期图片清单包含的图片数量（每会话），默认 5。实时消息中的图片和定时任务读取到的历史消息图片都会进入清单。 |
 | `auto_attach_recent_image` | switch | 否 | 吸附模式：发说说未指定图片时自动抓最近一张图（AI 不知道图片内容；抓不到会降级为纯文字，不会发送失败），默认关闭。开启后会取代 AI 通过近期图片清单知情选图的行为（彻底回到旧版配图逻辑）。 |
 | `qzone_image_desc_enabled` | switch | 否 | 是否启用空间说说配图识别（`qzone_describe_image` 工具），默认开启。 |
 | `qzone_image_desc_own` | switch | 否 | 是否允许 AI 对自己空间的说说调用识图，默认关闭（配图本来就是她自己选的，通常没必要）。 |
@@ -181,7 +187,7 @@ Cron 表达式由5个字段组成：**分 时 日 月 周**。常用写法如下
 - **配置**：填写 `task_group_ids` 或 `task_private_ids`。
 - **工作原理**：定时时间到达后，插件会向随机选择的群聊或私聊发送一条特殊指令（例如“【定时任务】请根据最近聊天发布一条说说”），发布任务的指令会自动附带场合信息（如「当前场合：群『绿岛酒吧』188395693」或「与『周武』的私聊」；评论/回复任务针对的是空间说说，不附带场合），AI 在该会话中收到消息后，会像普通对话一样处理，自主生成内容并发布/评论/回复。发布成功后，AI 可以根据你的提示词决定是否调用记忆工具记录。
 - **LLM 归属**：由 KiraAI 主流程处理，使用主流程配置的 LLM 模型（`backend_llm_model` 不生效）。
-- **配图控制**：由 AI 自行决定是否配图（`auto_publish_image_prob` 不生效）；开启「近期图片清单」后，她能看到最近图片的内容描述并按序号知情选图。
+- **配图控制**：由 AI 自行决定是否配图；不开启吸附模式时，实时消息图片和定时任务读取到的历史图片都会进入近期图片清单。AI 可用 `image_indices` 选择，也可以在 `images` 中直接传 QQ 多媒体 URL 或本地路径。
 - **优点**：内容自然，符合人设，记忆记录由 AI 自主控制，不会强制记录每一条。
 - **缺点**：需要依赖目标会话的活跃（但指令发送后 AI 会自动处理，不影响用户）。
 
@@ -189,7 +195,7 @@ Cron 表达式由5个字段组成：**分 时 日 月 周**。常用写法如下
 - **配置**：不填写任何任务目标，而是填写 `auto_publish_group_id` 或 `auto_publish_user_id`。
 - **工作原理**：定时时间到达后，插件直接从指定群聊或私聊获取最近聊天记录，调用 LLM 生成内容并发布/评论/回复，**整个过程在后台完成，不发送任何消息到群聊**。
 - **LLM 归属**：由插件内部调用，可使用 `backend_llm_model` 单独指定模型。
-- **配图控制**：受 `auto_publish_image_prob` 概率控制；候选图会先经 VLM 识别内容，由 LLM 看过描述后再决定是否选用（不再是盲选）。
+- **配图控制**：受 `auto_publish_image_prob` 概率控制；候选图片按去重间隔过滤，AI 可输出 `IMG:1,3` 选择多张图；非法选择按 `auto_publish_image_fallback` 处理。
 - **优点**：完全静默，不影响群聊。
 - **缺点**：内容生成不经过 AI 的完整对话上下文，可能略显生硬，且**不会自动记录记忆**（除非你修改代码强制写入）。
 
@@ -223,13 +229,14 @@ Cron 表达式由5个字段组成：**分 时 日 月 周**。常用写法如下
 
 ### QQ空间工具
 你拥有以下工具，可以操作我的QQ空间：
-- `qzone_publish(text, images, image_indices)`：发布一条说说。配图优先用你了解内容的方式：`images` 传聊天里出现过的图片路径（如 data/temp/xxx.jpg），或用 `image_indices` 引用[近期图片]清单里的序号；都不传则发纯文字。
+- `qzone_publish(text, images, image_indices)`：发布一条说说。`images` 可传聊天消息中出现的 QQ 多媒体 URL（例如 `https://multimedia.nt.qq.com.cn/download?...`）或本地路径；`image_indices` 可引用近期图片清单序号。不开启吸附模式也可以使用这两种方式。都不传则发纯文字。
 - `qzone_view(target_id, num)`：查看说说，target_id 是QQ号（不填则看自己的），num 是条数。返回的每条说说会包含发布时间和评论时间，你可以据此判断动态的新旧。
 - `qzone_describe_image(target_id, tid, index)`：识别说说中第 index 张配图的实际内容。他人的说说文字暗示图片很重要、或你打算评论前想了解图片内容时调用；自己的说说一般不要调用。
 - `qzone_like(target_id, tid)`：给指定说说点赞。
+- `qzone_visitors()`：查看自己空间最近访客、来源、隐身/黄钻状态和今日/最近30天统计。
 - `qzone_comment(target_id, tid, content)`：评论指定说说。
 - `qzone_delete(tid)`：删除自己的一条说说。
-- `qzone_reply_comment(target_id, tid, comment_id, content)`：回复指定评论，`content` 不填则 AI 自动生成。
+- `qzone_reply_comment(target_id, tid, comment_id, comment_uin, content)`：回复指定评论。评论 ID 和作者 UIN 从 `qzone_view` 获取；主评论与楼中回复可能使用相同 ID，重复时必须同时传 `comment_uin`。
 
 ### 记忆记录
 当你发布一条有意义的说说或进行重要互动后，可以调用 `memory_update` 工具记录为事件，以便以后回忆。例如：`memory_update(operations=[{"op":"event","value":"我发了一条说说：今天天气真好"}])`。
@@ -315,7 +322,8 @@ A：可能是适配器尚未完全就绪或网络抖动。插件会保留现有�
 
 - **白名单机制说明**：插件内置的代码层白名单（`master_ids`配置项）在部分测试环境中可能未完全生效，无法可靠地拦截非主人调用敏感工具。因此，**强烈建议依赖提示词层进行权限控制**。请在`persona`中明确写明主人的QQ号并添加拒绝规则。
 - **点赞功能**：v1.40 已修复点赞（三级降级 + 完整 Cookie + 正确的发布时间参数）。如果个别账号仍点赞失败，多为腾讯风控限制（如操作过于频繁），请降低自动评论/点赞频率。
-- **评论回复的 @ 功能**：回复评论时，插件会自动在内容前加上 `回复 @昵称：`，以实现子回复效果，但可能会形成重复@昵称效果（已在 v1.30 尝试优化）。
+- **评论回复关系**：`qzone_view` 显示主评论/楼中回复、每条自身 ID 和作者 UIN。回复楼中回复时，插件用主评论的完整 `commentId/commentUin` 锚定评论线程，再用 QQ 空间原生关系标记指定目标作者；不会手工拼接可见的 `回复 @昵称：`。存在明确回复对象时显示为 `周武 回复 Shana(UIN:3463604015) [时间]: 正文`。
+
 - **自动评论和回复的限制**：自动评论任务会检查说说发布时间，默认超过7天的说说不予评论（可在 `instruction` 中修改）。这有助于避免“挖坟”行为，但依赖模型智力不一定总是奏效。自动回复选取和略过同理。
 
 
