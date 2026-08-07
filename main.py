@@ -25,6 +25,13 @@ from core.provider import LLMRequest
 from .qzone.api import QzoneAPI
 from .qzone.session import QzoneSession
 from .qzone.utils import download_file, looks_like_image
+from .qzone.image_policy import (
+    build_instruction as build_image_instruction,
+    candidate_label,
+    dedupe_sources,
+    draw_target as draw_image_target,
+    resolve_described_sources,
+)
 from .qzone.parser import QzoneParser
 from .qzone.model import Post as QzonePost, Comment as QzoneComment
 
@@ -197,6 +204,53 @@ class QzonePlugin(BasePlugin):
             return max(minimum, min(maximum, float(value)))
         except (TypeError, ValueError):
             return minimum
+
+    def _draw_auto_publish_image_target(self) -> int:
+        """为一次定时发布抽取配图目标；0 表示交给 AI 自主决定。"""
+        return draw_image_target(
+            self.auto_publish_image_min,
+            self.auto_publish_image_max,
+        )
+
+    def _auto_publish_image_instruction(self, target: int) -> str:
+        return build_image_instruction(target, self.auto_publish_image_max)
+
+    @staticmethod
+    def _dedupe_sources(sources: list[str]) -> list[str]:
+        return dedupe_sources(sources)
+
+    def _scheduled_publish_policy(self, event) -> tuple[int, int] | None:
+        """读取合成定时发布事件的任务级配图策略，普通发布不受影响。"""
+        for message in getattr(event, "messages", None) or []:
+            extra = getattr(message, "extra", None) or {}
+            if not extra.get("qzone_publish_task"):
+                continue
+            try:
+                target = int(extra["qzone_target_image_count"])
+                maximum = int(extra["qzone_max_image_count"])
+            except (KeyError, TypeError, ValueError):
+                return None
+            return max(0, min(target, maximum)), max(0, maximum)
+        return None
+
+    async def _fill_scheduled_publish_sources(
+        self,
+        sid: str,
+        selected: list[str],
+        target: int,
+    ) -> list[str]:
+        """用当前会话清单补足自动任务的正数目标；候选耗尽后允许自然降级。"""
+        selected = self._dedupe_sources(selected)
+        if target <= 0 or len(selected) >= target:
+            return selected[:target] if target > 0 else selected
+        for index in range(1, len(self._manifest_entries(sid)) + 1):
+            resolved = await self._resolve_manifest_images(sid, [index])
+            for source in resolved:
+                if source not in selected:
+                    selected.append(source)
+                    if len(selected) >= target:
+                        return selected[:target]
+        return selected
 
     async def _get_persona_content(self) -> str:
         """获取人设内容：配置 backend_persona 时用指定人设（id 或名称均可），否则用当前激活人设"""
@@ -564,7 +618,12 @@ class QzonePlugin(BasePlugin):
         self._user_name_cache[user_id] = (name, time.time())
         return name
 
-    async def _send_task_instruction(self, instruction_text: str, with_place: bool = True) -> bool:
+    async def _send_task_instruction(
+        self,
+        instruction_text: str,
+        with_place: bool = True,
+        task_extra: Optional[dict] = None,
+    ) -> bool:
         """发送定时任务指令（合成内部事件，带 qzone_task 标记供 silent 模式识别）
 
         with_place=False 用于评论/回复任务：操作对象是空间说说，与会话场合无关，
@@ -613,7 +672,7 @@ class QzonePlugin(BasePlugin):
                 chain=MessageChain([Text(instruction_text)]),
                 is_notice=True,
                 is_mentioned=True,
-                extra={"qzone_task": True},
+                extra={"qzone_task": True, **(task_extra or {})},
             ),
             timestamp=t,
         )
@@ -657,22 +716,36 @@ class QzonePlugin(BasePlugin):
 
             await self._ensure_api()
 
+            target_image_count = self._draw_auto_publish_image_target()
+            logger.info(
+                "定时自动发布配图目标: target=%s range=%s-%s",
+                target_image_count,
+                self.auto_publish_image_min,
+                self.auto_publish_image_max,
+            )
             if self.task_group_ids or self.task_private_ids:
                 instruction = (
                     "【定时任务】请根据最近聊天发布一条说说，自然一点，不要提及这是定时任务。"
-                    "根据[近期图片]清单和内容决定是否配图；配图时用image_indices选择"
-                    f"{self.auto_publish_image_min}至{self.auto_publish_image_max}张，也可用images传聊天记录里见过的图片URL或本地路径。"
+                    + self._auto_publish_image_instruction(target_image_count)
+                    + "配图时用image_indices选择，也可用images传聊天记录里见过的图片URL或本地路径。"
                 )
-                if await self._send_task_instruction(instruction):
+                if await self._send_task_instruction(
+                    instruction,
+                    task_extra={
+                        "qzone_publish_task": True,
+                        "qzone_target_image_count": target_image_count,
+                        "qzone_max_image_count": self.auto_publish_image_max,
+                    },
+                ):
                     self.last_auto_publish_time = datetime.now()
                 return
 
-            await self._legacy_auto_publish()
+            await self._legacy_auto_publish(target_image_count)
             self.last_auto_publish_time = datetime.now()
         except Exception as e:
             logger.error(f"自动发布任务失败: {e}")
 
-    async def _legacy_auto_publish(self):
+    async def _legacy_auto_publish(self, target_image_count: int):
         source_id = None
         source_type = None
         if self.auto_publish_group_id.strip():
@@ -703,29 +776,64 @@ class QzonePlugin(BasePlugin):
             prompt = "请生成一条QQ空间说说，内容可以是心情、日常、段子，20-50字，要符合你的人设。"
 
         image_urls: list[str] = []
-        if source_id and self.auto_publish_image_prob > 0 and random.random() < self.auto_publish_image_prob:
-            candidates = await self._fetch_recent_images(source_type, source_id, max_count=self.auto_publish_image_max)
+        should_offer_images = (
+            source_id
+            and (
+                target_image_count > 0
+                or (
+                    self.auto_publish_image_prob > 0
+                    and random.random() < self.auto_publish_image_prob
+                )
+            )
+        )
+        if should_offer_images:
+            fetch_count = max(self.auto_publish_image_max, target_image_count)
+            candidates = await self._fetch_recent_images(source_type, source_id, max_count=fetch_count)
             candidates = [url for url in candidates if not self._is_recently_published_image(url)]
-            described = []
+            candidates_with_desc = []
             for url in candidates:
                 desc = await self._describe_image_url(url)
-                if desc:
-                    described.append((url, desc))
-            if described:
+                candidates_with_desc.append(
+                    (url, candidate_label(desc))
+                )
+            if candidates_with_desc:
+                if target_image_count > 0:
+                    choice_rule = (
+                        f"本次必须选择恰好{target_image_count}个不同序号；"
+                        "候选不足时选择全部可用候选。"
+                    )
+                else:
+                    choice_rule = (
+                        f"可按内容自主选择0至{self.auto_publish_image_max}个不同序号；"
+                        "不适合配图时不要输出 IMG 行。"
+                    )
                 prompt += (
                     "\n\n以下是最近聊天中出现的图片及内容描述：\n"
-                    + "\n".join(f"{i}. {desc}" for i, (_, desc) in enumerate(described, 1))
-                    + f"\n如果适合配图，在正文后另起一行输出 IMG:序号 或 IMG:序号,序号，最多{self.auto_publish_image_max}张；否则不要输出 IMG 行。"
+                    + "\n".join(f"{i}. {desc}" for i, (_, desc) in enumerate(candidates_with_desc, 1))
+                    + "\n"
+                    + choice_rule
+                    + "正文后另起一行输出 IMG:序号 或 IMG:序号,序号。"
                 )
                 text_with_choice = await self._call_llm(prompt, system_prompt, use_backend_model=True)
                 text, chosen = self._split_img_choices(text_with_choice)
-                valid = [described[i - 1][0] for i in chosen if 1 <= i <= len(described)]
-                if len(valid) != len(chosen):
-                    valid = [] if not self.auto_publish_image_fallback else [url for url, _ in described[:self.auto_publish_image_min]]
-                if not chosen and self.auto_publish_image_min > 0:
-                    valid = [url for url, _ in described[:self.auto_publish_image_min]]
-                image_urls = valid[:self.auto_publish_image_max]
+                image_urls = resolve_described_sources(
+                    [url for url, _ in candidates_with_desc],
+                    chosen,
+                    target_image_count,
+                    self.auto_publish_image_max,
+                )
+                if target_image_count > 0 and len(image_urls) < target_image_count:
+                    logger.info(
+                        "自动发布图片目标降级: target=%s usable=%s",
+                        target_image_count,
+                        len(image_urls),
+                    )
             else:
+                if target_image_count > 0:
+                    logger.info(
+                        "自动发布图片目标降级为纯文字: target=%s 无可用候选",
+                        target_image_count,
+                    )
                 text = await self._call_llm(prompt, system_prompt, use_backend_model=True)
         else:
             text = await self._call_llm(prompt, system_prompt, use_backend_model=True)
@@ -1144,11 +1252,10 @@ class QzonePlugin(BasePlugin):
             lines = []
             for i, entry in enumerate(entries, 1):
                 desc = await self._resolve_entry_desc(entry)
-                if not desc:
-                    continue
+                display_desc = candidate_label(desc)
                 time_str = datetime.fromtimestamp(entry["time"]).strftime("%m-%d %H:%M")
                 sender = entry.get("sender") or "未知"
-                lines.append(f"{i}. [{time_str} {sender}] {desc}")
+                lines.append(f"{i}. [{time_str} {sender}] {display_desc}")
             if not lines:
                 return
             text = (
@@ -1542,6 +1649,9 @@ class QzonePlugin(BasePlugin):
             return "抱歉，只有主人才能使用此功能。"
         await self._ensure_api()
         try:
+            task_policy = self._scheduled_publish_policy(event)
+            task_target = task_policy[0] if task_policy else None
+            task_maximum = task_policy[1] if task_policy else None
             images = images or []
             image_indices = image_indices or []
             valid_sources = []
@@ -1555,18 +1665,49 @@ class QzonePlugin(BasePlugin):
             if image_indices:
                 resolved = await self._resolve_manifest_images(event.sid, image_indices)
                 if not resolved:
-                    return (
-                        f"未能从[近期图片]清单解析出图片（当前会话清单为空，或序号 {image_indices} 超出范围），说说未发布。"
-                        "如确认发纯文字，请不带 image_indices 重试；"
-                        "如想配图，可改用 images 参数传图片 URL 或本地路径（如 data/temp/xxx.jpg）。"
+                    if task_target is None:
+                        return (
+                            f"未能从[近期图片]清单解析出图片（当前会话清单为空，或序号 {image_indices} 超出范围），说说未发布。"
+                            "如确认发纯文字，请不带 image_indices 重试；"
+                            "如想配图，可改用 images 参数传图片 URL 或本地路径（如 data/temp/xxx.jpg）。"
+                        )
+                    logger.info(
+                        "定时发布清单选择不可用，按资源降级: target=%s indices=%s",
+                        task_target,
+                        image_indices,
                     )
                 valid_sources.extend(resolved)
             elif images and not valid_sources:
                 return "images 参数中的地址均无效，说说未发布。请传有效的图片 URL 或本地路径。"
+            valid_sources = self._dedupe_sources(valid_sources)
+            if task_target is not None:
+                if task_target > 0:
+                    valid_sources = await self._fill_scheduled_publish_sources(
+                        event.sid, valid_sources, task_target
+                    )
+                    if len(valid_sources) < task_target:
+                        recent = await self._fetch_recent_images_for_event(
+                            event, max_count=task_target
+                        )
+                        valid_sources = self._dedupe_sources(
+                            valid_sources + recent
+                        )[:task_target]
+                    if len(valid_sources) < task_target:
+                        logger.info(
+                            "定时发布工具层图片目标降级: target=%s usable=%s",
+                            task_target,
+                            len(valid_sources),
+                        )
+                else:
+                    valid_sources = valid_sources[:task_maximum]
             # 吸附兑底：未指定图片且开启吸附模式时，自动抓最近一张图
             # （吸附图下载失败会降级为纯文字发布，保持“有时配有时不配”的随机感）
             allow_drop = False
-            if not valid_sources and self.auto_attach_recent_image:
+            if (
+                task_policy is None
+                and not valid_sources
+                and self.auto_attach_recent_image
+            ):
                 valid_sources = await self._fetch_recent_images_for_event(event, max_count=1)
                 allow_drop = bool(valid_sources)
             result = await self._publish(text, valid_sources, allow_image_drop=allow_drop)

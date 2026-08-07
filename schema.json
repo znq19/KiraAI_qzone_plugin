@@ -98,12 +98,12 @@
     "auto_publish_image_min": {
         "type": "int",
         "default": 0,
-        "hint": "主动发布最少图片数。0表示允许纯文字，但仍会展示候选清单。"
+        "hint": "定时自动发布每次随机抽取的配图目标下限。抽到0时AI可按内容自主选择0至最大值张；抽到正数时优先按该数量配图，候选不足时允许少图或纯文字降级。"
     },
     "auto_publish_image_max": {
         "type": "int",
         "default": 3,
-        "hint": "主动发布最多图片数。"
+        "hint": "定时自动发布每次随机抽取的配图目标上限，也是抽到0时AI可自主选择的最多图片数。仅影响定时任务，不影响用户主动发布。"
     },
     "auto_publish_image_fallback": {
         "type": "switch",
