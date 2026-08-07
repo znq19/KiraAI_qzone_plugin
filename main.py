@@ -1071,7 +1071,13 @@ class QzonePlugin(BasePlugin):
                     session_id = str(m.sender.user_id)
                     break
         if not session_id:
-            logger.error("无法从事件中获取会话ID")
+            session = getattr(event, "session", None)
+            raw_session_id = getattr(session, "session_id", None)
+            raw_session_type = getattr(session, "session_type", None)
+            if raw_session_id:
+                session_id = str(raw_session_id)
+                session_type = "group" if raw_session_type == "gm" else "private"
+        if not session_id:
             return []
         return await self._fetch_recent_images(session_type, session_id, max_count)
 
@@ -1289,11 +1295,13 @@ class QzonePlugin(BasePlugin):
                     url = seg.get("data", {}).get("url", "")
                     if url:
                         url = html.unescape(url.strip().strip('"').strip("'"))
-                        elem: Image = entry["elem"]
-                        elem.image = url
-                        elem.file = url
-                        elem.image_type = "url"
-                        elem._temp_path = None  # 作废可能已污染的缓存文件
+                        entry["url"] = url
+                        elem = entry.get("elem")
+                        if elem is not None:
+                            elem.image = url
+                            elem.file = url
+                            elem.image_type = "url"
+                            elem._temp_path = None  # 作废可能已污染的缓存文件
                         logger.info(f"已通过 get_msg 刷新过期图片 URL (msg_id={msg_id})")
                         return True
         except Exception as e:
@@ -1342,6 +1350,37 @@ class QzonePlugin(BasePlugin):
             return paths
         finally:
             pass
+
+    def _find_image_registry_entry(self, sid: str, source: str) -> Optional[dict]:
+        """按来源 URL 定位候选，优先当前会话，再检查其他会话的同源条目。"""
+        registries = [self._image_registry.get(sid) or []]
+        registries.extend(
+            entries
+            for registry_sid, entries in self._image_registry.items()
+            if registry_sid != sid
+        )
+        for registry in registries:
+            for entry in reversed(registry):
+                if entry.get("url") == source:
+                    return entry
+                elem = entry.get("elem")
+                if elem is not None and source in {
+                    str(getattr(elem, "image", "") or ""),
+                    str(getattr(elem, "file", "") or ""),
+                }:
+                    return entry
+        return None
+
+    async def _refresh_explicit_image_sources(self, sid: str, sources: list[str]) -> list[str]:
+        """刷新 Bot 通过 images 传回的 QQ 临时 URL；非清单来源保持原值。"""
+        refreshed = []
+        for source in sources:
+            entry = self._find_image_registry_entry(sid, source)
+            if entry and await self._refresh_image_url(entry):
+                refreshed.append(entry.get("url") or source)
+            else:
+                refreshed.append(source)
+        return refreshed
 
     # ---------- 核心 API 封装 ----------
     def _image_identity(self, source: str) -> str:
@@ -1686,6 +1725,10 @@ class QzonePlugin(BasePlugin):
                 valid_sources.extend(resolved)
             elif images and not valid_sources:
                 return "images 参数中的地址均无效，说说未发布。请传有效的图片 URL 或本地路径。"
+            if task_policy is not None and images:
+                valid_sources = await self._refresh_explicit_image_sources(
+                    event.sid, valid_sources
+                )
             valid_sources = self._dedupe_sources(valid_sources)
             if task_target is not None:
                 if task_target > 0:
