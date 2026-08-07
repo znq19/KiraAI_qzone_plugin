@@ -999,6 +999,13 @@ class QzonePlugin(BasePlugin):
         if len(registry) > IMAGE_REGISTRY_CAP:
             del registry[: len(registry) - IMAGE_REGISTRY_CAP]
 
+    async def _fetch_history_messages(
+        self,
+        source_type: str,
+        source_id: str,
+        count: int = 20,
+    ) -> List[dict]:
+        """读取 OneBot 群聊或私聊历史，并将其中的图片 URL 登记为候选。"""
         action = "get_group_msg_history" if source_type == "group" else "get_friend_msg_history"
         key = "group_id" if source_type == "group" else "user_id"
         result = await self._call_onebot_action(action, {key: int(source_id), "count": count})
