@@ -40,8 +40,9 @@ class QzoneAPI(QzoneHttpClient):
     UPLOAD_IMAGE_URL = "https://up.qzone.qq.com/cgi-bin/upload/cgi_upload_image"
     EMOTION_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_publish_v6"
     DOLIKE_URL = "https://user.qzone.qq.com/proxy/domain/w.qzone.qq.com/cgi-bin/likes/internal_dolike_app"
-    LIKE_V6_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/like_cgi_likev6"
-    MOBILE_LIKE_URL = "https://mobile.qzone.qq.com/like"
+    DOLIKE_UNLIKE_URL = "https://user.qzone.qq.com/proxy/domain/w.qzone.qq.com/cgi-bin/likes/internal_unlike_app"
+    LIKE_LIST_URL = "https://user.qzone.qq.com/proxy/domain/users.qzone.qq.com/cgi-bin/likes/get_like_list_app"
+    PERSONAL_CARD_URL = "https://user.qzone.qq.com/proxy/domain/r.qzone.qq.com/cgi-bin/user/cgi_personal_card"
     LIST_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qq.com/cgi-bin/emotion_cgi_msglist_v6"
     COMMENT_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_re_feeds"
     COMMENT_H5_URL = "https://h5.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_re_feeds"
@@ -49,7 +50,10 @@ class QzoneAPI(QzoneHttpClient):
     VISITOR_URL = "https://h5.qzone.qq.com/proxy/domain/g.qzone.qq.com/cgi-bin/friendshow/cgi_get_visitor_more"
     REPLY_URL = "https://h5.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_re_feeds"
     DELETE_URL = "https://h5.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_delete_v6"
+    DELETE_COMMENT_H5_URL = "https://h5.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_delcomment_ugc"
     DETAIL_URL = "https://h5.qzone.qq.com/proxy/domain/taotao.qq.com/cgi-bin/emotion_cgi_msgdetail_v6"
+    DETAIL_PC_URL = "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/cgi-bin/emotion_cgi_getdetailv6"
+    DETAIL_MOBILE_URL = "https://mobile.qzone.qq.com/detail"
 
     def __init__(self, session: QzoneSession, config):
         super().__init__(session, config)
@@ -202,104 +206,56 @@ class QzoneAPI(QzoneHttpClient):
         typeid: int = 0,
     ) -> ApiResponse:
         """
-        点赞指定说说（三级降级，参考 onebot-qzone 实机验证实现）：
-        1. internal_dolike_app（w.qzone.qq.com）
-        2. like_cgi_likev6（taotao.qzone.qq.com）
-        3. mobile.qzone.qq.com/like
-        abstime 应为说说的发布时间（不是当前时间），缺失时回退当前时间。
+        点赞指定说说。
+
+        参数采用精易论坛 2024 实测成功格式（网页端真实抓包）：
+        - unikey/curkey 带 `.1` 后缀：http://user.qzone.qq.com/{作者}/mood/{tid}.1
+        - from=-100, face=0
+        - 旧格式（from=1、unikey 无 .1、带 appid/typeid/fid）在现代 QQ 空间
+          返回 ret=0 但实际不生效（假成功），不再使用。
         """
         ctx = await self.session.get_ctx()
         tid = normalize_tid(post.tid)
-        abstime = int(abstime or getattr(post, "create_time", 0) or time.time())
-        if appid == 311:
-            unikey = f"http://user.qzone.qq.com/{post.uin}/mood/{tid}"
-        else:
-            unikey = f"http://user.qzone.qq.com/{post.uin}/app/{tid}"
-        qzreferrer = f"{self.BASE_URL}/{ctx.uin}/main"
-        errors: list[str] = []
+        unikey = f"http://user.qzone.qq.com/{post.uin}/mood/{tid}.1"
+        qzreferrer = f"https://user.qzone.qq.com/{post.uin}"
 
-        # 方法1: internal_dolike_app
         try:
-            raw1 = await self.request(
+            raw = await self.request(
                 "POST",
                 self.DOLIKE_URL,
                 params={"g_tk": ctx.gtk2},
                 data={
                     "qzreferrer": qzreferrer,
-                    "opuin": ctx.uin,
+                    "opuin": post.uin,
                     "unikey": unikey,
                     "curkey": unikey,
-                    "appid": appid,
-                    "typeid": typeid,
-                    "fid": tid,
-                    "from": 1,
-                    "active": 0,
+                    "from": -100,
                     "fupdate": 1,
-                    "abstime": abstime,
+                    "face": 0,
                     "format": "json",
                 },
             )
-            if raw1.get("ret") == 0 or raw1.get("code") == 0:
-                raw1["code"] = 0
-                return ApiResponse.from_raw(raw1)
-            errors.append(f"dolike: code={raw1.get('code')} msg={raw1.get('message') or raw1.get('msg')}")
-        except Exception as e:
-            errors.append(f"dolike: {e}")
-
-        # 方法2: like_cgi_likev6
-        try:
-            raw2 = await self.request(
-                "POST",
-                self.LIKE_V6_URL,
-                params={"g_tk": ctx.gtk2},
-                data={
-                    "opuin": ctx.uin,
-                    "ouin": post.uin,
-                    "fid": tid,
-                    "abstime": abstime,
-                    "appid": appid,
-                    "typeid": typeid,
-                    "key": "",
-                    "format": "json",
-                    "qzreferrer": qzreferrer,
-                },
+            if raw.get("ret") == 0 or raw.get("code") == 0:
+                raw["code"] = 0
+                logger.info(f"QZone点赞成功: route=dolike post={tid}")
+                return ApiResponse.from_raw(raw)
+            logger.warning(
+                f"点赞失败(dolike): code={raw.get('code')} ret={raw.get('ret')} "
+                f"msg={raw.get('message') or raw.get('msg')}"
             )
-            if raw2.get("ret") == 0 or raw2.get("code") == 0:
-                raw2["code"] = 0
-                return ApiResponse.from_raw(raw2)
-            errors.append(f"likev6: code={raw2.get('code')} msg={raw2.get('message') or raw2.get('msg')}")
-        except Exception as e:
-            errors.append(f"likev6: {e}")
-
-        # 方法3: mobile like（兜底）
-        try:
-            raw3 = await self.request(
-                "POST",
-                self.MOBILE_LIKE_URL,
-                params={"g_tk": ctx.gtk2},
-                data={
-                    "unikey": unikey,
-                    "curkey": unikey,
-                    "appid": appid,
-                    "typeid": typeid,
-                    "active": 0,
-                    "fupdate": 1,
-                },
-                headers={
-                    "User-Agent": _MOBILE_UA,
-                    "Referer": "https://mobile.qzone.qq.com",
-                    "Accept": "application/json, text/plain, */*",
-                    "X-Requested-With": "XMLHttpRequest",
-                },
+            return ApiResponse(
+                ok=False,
+                code=-1,
+                message=f"点赞失败: code={raw.get('code')} msg={raw.get('message') or raw.get('msg')}",
+                data={},
+                raw=raw,
             )
-            if raw3.get("ret") == 0 or raw3.get("code") == 0:
-                raw3["code"] = 0
-                return ApiResponse.from_raw(raw3)
-            errors.append(f"mobile: code={raw3.get('code')} msg={raw3.get('message') or raw3.get('msg')}")
         except Exception as e:
-            errors.append(f"mobile: {e}")
-
-        logger.warning(f"点赞三级降级全部失败: {' | '.join(errors)}")
+            logger.warning(f"点赞异常(dolike): {e}")
+            return ApiResponse(
+                ok=False, code=-1, message=str(e),
+                data={}, raw={},
+            )
         return ApiResponse(
             ok=False,
             code=-1,
@@ -307,6 +263,169 @@ class QzoneAPI(QzoneHttpClient):
             data={},
             raw={},
         )
+
+    async def unlike(
+        self,
+        post: Post,
+        abstime: int | None = None,
+        appid: int = 311,
+        typeid: int = 0,
+    ) -> ApiResponse:
+        """
+        取消点赞指定说说。
+
+        唯一路径：internal_unlike_app（精易论坛实测：把 internal_dolike_app 的 DOlike
+        改成 unlike 即取消赞）+ 精易 2024 实测成功参数：
+        - unikey/curkey 带 `.1` 后缀
+        - from=-100, face=0
+        旧格式（active 参数切换 / from=1 / unikey 无 .1）均假成功，不再使用。
+        """
+        ctx = await self.session.get_ctx()
+        tid = normalize_tid(post.tid)
+        unikey = f"http://user.qzone.qq.com/{post.uin}/mood/{tid}.1"
+        qzreferrer = f"https://user.qzone.qq.com/{post.uin}"
+
+        try:
+            raw = await self.request(
+                "POST",
+                self.DOLIKE_UNLIKE_URL,
+                params={"g_tk": ctx.gtk2},
+                data={
+                    "qzreferrer": qzreferrer,
+                    "opuin": post.uin,
+                    "unikey": unikey,
+                    "curkey": unikey,
+                    "from": -100,
+                    "fupdate": 1,
+                    "face": 0,
+                    "format": "json",
+                },
+            )
+            if raw.get("ret") == 0 or raw.get("code") == 0:
+                raw["code"] = 0
+                logger.info(
+                    f"QZone取消点赞成功: route=unlike_app post={tid}"
+                )
+                return ApiResponse.from_raw(raw)
+            logger.warning(
+                f"取消点赞失败(unlike_app): code={raw.get('code')} ret={raw.get('ret')} "
+                f"msg={raw.get('message') or raw.get('msg')}"
+            )
+            return ApiResponse(
+                ok=False,
+                code=-1,
+                message=f"取消点赞失败: code={raw.get('code')} msg={raw.get('message') or raw.get('msg')}",
+                data={},
+                raw=raw,
+            )
+        except Exception as e:
+            logger.warning(f"取消点赞异常(unlike_app): {e}")
+            return ApiResponse(
+                ok=False, code=-1, message=str(e),
+                data={}, raw={},
+            )
+
+    async def get_like_list(self, post: Post, query_count: int = 20) -> ApiResponse:
+        """获取说说点赞列表（点赞人 + 总数），模拟空间页「xx等人觉得很赞」。
+
+        点赞人是独立接口 get_like_list_app 返回（说说列表/详情接口不含点赞人明细）：
+        - unikey 需带 `.1` 后缀（与点赞操作的 unikey 不同，见爬虫实测）
+        - 返回 data.like_uin_info（[{fuin, nick, ...}]）+ data.total_number
+        """
+        ctx = await self.session.get_ctx()
+        tid = normalize_tid(post.tid)
+        # 优先用说说的真实 like key（curlikekey/orglikekey，取自详情/列表接口），
+        # 手拼 unikey 仅作回退：`http://user.qzone.qq.com/{作者}/mood/{tid}.1`
+        # （.1 后缀与点赞操作的 unikey 不同，为点赞列表弹窗专用格式）
+        like_key = getattr(post, "like_key", "") or ""
+        if like_key:
+            unikey = like_key
+        else:
+            unikey = f"http://user.qzone.qq.com/{post.uin}/mood/{tid}.1"
+        try:
+            raw = await self.request(
+                "GET",
+                self.LIKE_LIST_URL,
+                params={
+                    "uin": ctx.uin,
+                    "unikey": unikey,
+                    "begin_uin": 0,
+                    "query_count": query_count,
+                    "if_first_page": 1,
+                    "g_tk": ctx.gtk2,
+                    "format": "json",
+                },
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+                    "Referer": f"https://user.qzone.qq.com/{post.uin}",
+                },
+                empty_retry_limit=1,
+            )
+            data = raw.get("data") if isinstance(raw.get("data"), dict) else {}
+            like_uin_info = data.get("like_uin_info") if isinstance(data.get("like_uin_info"), list) else []
+            total = data.get("total_number") or len(like_uin_info) or 0
+            # is_dolike：当前用户是否已赞（接口真实字段，CSDN 爬取教程确认）
+            is_dolike = data.get("is_dolike") in (1, True, "1")
+            like_uins = [
+                str(u.get("fuin") or u.get("uin") or "")
+                for u in like_uin_info
+                if isinstance(u, dict) and (u.get("fuin") or u.get("uin"))
+            ]
+            uin_str = ",".join(like_uins) or "-"
+            logger.info(
+                f"QZone点赞列表: post={tid} total={total} shown={len(like_uin_info)} "
+                f"is_dolike={is_dolike} uins=[{uin_str}] key={'real' if like_key else 'handmade'}"
+            )
+            return ApiResponse(
+                ok=True, code=0, message=None,
+                data={
+                    "like_uin_info": like_uin_info,
+                    "like_uins": like_uins,
+                    "total_number": total,
+                    "is_dolike": is_dolike,
+                },
+                raw=raw,
+            )
+        except Exception as e:
+            logger.debug(f"获取点赞列表失败: post={tid} err={e}")
+            return ApiResponse(
+                ok=False, code=-1, message=str(e),
+                data={}, raw={},
+            )
+
+    async def get_user_info(self, uin: str) -> ApiResponse:
+        """获取用户基本资料（昵称等），用于展示自己昵称（防「我」昵称诈骗）。"""
+        ctx = await self.session.get_ctx()
+        try:
+            raw = await self.request(
+                "GET",
+                self.PERSONAL_CARD_URL,
+                params={"uin": uin, "g_tk": ctx.gtk2},
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+                    "Referer": f"https://user.qzone.qq.com/{uin}",
+                },
+                empty_retry_limit=1,
+            )
+            data = raw.get("data") if isinstance(raw.get("data"), dict) else {}
+            nickname = str(
+                data.get("nickname")
+                or data.get("nick")
+                or data.get("name")
+                or ""
+            )
+            logger.info(f"QZone用户资料: uin={uin} nickname={nickname}")
+            return ApiResponse(
+                ok=True, code=0, message=None,
+                data={"nickname": nickname, "uin": uin},
+                raw=raw,
+            )
+        except Exception as e:
+            logger.debug(f"获取用户资料失败: uin={uin} err={e}")
+            return ApiResponse(
+                ok=False, code=-1, message=str(e),
+                data={}, raw={},
+            )
 
     async def comment(self, post: Post, content: str) -> ApiResponse:
         """评论指定说说，优先使用 user JSON 路径，失败后回退 H5 表单路径。"""
@@ -325,8 +444,15 @@ class QzoneAPI(QzoneHttpClient):
                 "qzreferrer": qzreferrer,
             },
         )
+        # QZone 部分接口成功时返回 ret=0 而非 code=0，统一兼容，
+        # 避免 user 路径实际成功却误判失败 → 走 H5 再发一条 → 重复评论
         user_resp = ApiResponse.from_raw(raw_user)
-        if user_resp.ok:
+        if user_resp.ok or raw_user.get("ret") == 0:
+            if not user_resp.ok:
+                user_resp = ApiResponse(
+                    ok=True, code=0, message=None,
+                    data=dict(raw_user), raw=raw_user,
+                )
             logger.info(
                 "QZone评论接口成功: route=user post=%s code=%s",
                 post.tid,
@@ -372,7 +498,12 @@ class QzoneAPI(QzoneHttpClient):
             },
         )
         h5_resp = ApiResponse.from_raw(raw_h5)
-        if h5_resp.ok:
+        if h5_resp.ok or raw_h5.get("ret") == 0:
+            if not h5_resp.ok:
+                h5_resp = ApiResponse(
+                    ok=True, code=0, message=None,
+                    data=dict(raw_h5), raw=raw_h5,
+                )
             logger.info(
                 "QZone评论接口成功: route=h5 post=%s code=%s",
                 post.tid,
@@ -506,6 +637,123 @@ class QzoneAPI(QzoneHttpClient):
         )
         return ApiResponse.from_raw(raw)
 
+    async def delete_comment(
+        self,
+        uin: str,
+        tid: str,
+        comment_id: str,
+        comment_uin: str = "",
+    ) -> ApiResponse:
+        """删除指定评论（主评论或楼中回复）。
+
+        唯一路径：h5 代理域 emotion_cgi_delcomment_ugc（实测成功）。
+        uin/tid: 说说的作者 QQ 与说说 ID（topicId = uin_tid）
+        comment_id: 评论 ID（短楼层号 1/2/3 即可，网页端同款，无需真实长 ID）
+        comment_uin: 评论作者 QQ（仅用于 tool 层反查定位，本接口请求不携带）
+        支持场景：删自己空间的评论、删自己发在别人说说下的评论/回复。
+        """
+        ctx = await self.session.get_ctx()
+        topic_id = f"{uin}_{tid}"
+        qzreferrer = f"https://user.qzone.qq.com/{ctx.uin}/main"
+        errors: list[str] = []
+
+        def _ok(raw: dict) -> bool:
+            """成功判定兼容顶层与嵌套 data 里的 ret/code。
+
+            注意：不能用 `val or -1` 这类写法——code=0 时 0 是 falsy，
+            会被 `or` 吞掉变成 -1，导致"实际成功（code=0）被判失败"。
+            必须用 None 判断。
+            """
+            for container in (raw, raw.get("data")):
+                if not isinstance(container, dict):
+                    continue
+                for key in ("ret", "code"):
+                    val = container.get(key)
+                    if val is None:
+                        continue
+                    try:
+                        if int(val) == 0:
+                            return True
+                    except (TypeError, ValueError):
+                        continue
+            return False
+
+        def _msg(raw: dict) -> str:
+            for container in (raw, raw.get("data")):
+                if not isinstance(container, dict):
+                    continue
+                for key in ("msg", "message"):
+                    if container.get(key):
+                        return str(container[key])
+            return ""
+
+        # 唯一路径：h5 代理域 emotion_cgi_delcomment_ugc（实测成功，见更新记录 v1.4.4）。
+        # user.qzone.qq.com 域 / sns / mobile 在 NapCat 环境全部不可用（-3/空响应），已移除；
+        # 若将来换环境需要恢复，参考更新记录 v1.4.4 的历史实现。
+        # v1 为实测版参数（topicId+commentId+format=fs，网页端同款，短楼层号可直接删）；
+        # v0 仅作同域参数兜底。
+        variants = (
+            {
+                "uin": ctx.uin,
+                "hostUin": uin,
+                "topicId": topic_id,
+                "commentId": comment_id,
+                "inCharset": "utf-8",
+                "outCharset": "utf-8",
+                "ref": "",
+                "hostuin": ctx.uin,
+                "code_version": "1",
+                "format": "fs",
+                "qzreferrer": f"https://user.qzone.qq.com/{ctx.uin}",
+            },
+            {
+                "hostuin": ctx.uin,
+                "uin": uin,
+                "tid": tid,
+                "comment_id": comment_id,
+                "format": "json",
+                "qzreferrer": qzreferrer,
+            },
+        )
+        for idx, ugc_data in enumerate(variants):
+            try:
+                raw_ugc = await self.request(
+                    "POST",
+                    self.DELETE_COMMENT_H5_URL,
+                    params={"g_tk": ctx.gtk2},
+                    data=ugc_data,
+                    headers={
+                        "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+                        "Referer": "https://h5.qzone.qq.com/",
+                        "Origin": "https://h5.qzone.qq.com",
+                        "Accept": "*/*",
+                    },
+                    empty_retry_limit=1,
+                )
+                if _ok(raw_ugc):
+                    logger.info(
+                        "QZone删除评论成功: route=h5 variant=%s post=%s comment=%s",
+                        idx, tid, comment_id,
+                    )
+                    return ApiResponse(
+                        ok=True, code=0, message=None,
+                        data=dict(raw_ugc), raw=raw_ugc,
+                    )
+                errors.append(
+                    f"h5[v{idx}]: code={raw_ugc.get('code')} ret={raw_ugc.get('ret')} msg={_msg(raw_ugc)}"
+                )
+            except Exception as e:
+                errors.append(f"h5[v{idx}]: {e}")
+
+        logger.warning(f"删除评论失败（h5 域两次参数变体均失败）: {' | '.join(errors)}")
+        return ApiResponse(
+            ok=False,
+            code=-1,
+            message="; ".join(errors) or "删除评论失败",
+            data={},
+            raw={},
+        )
+
     async def get_feeds(
         self,
         target_id: str,
@@ -539,20 +787,97 @@ class QzoneAPI(QzoneHttpClient):
 
     async def get_detail(self, post: Post) -> ApiResponse:
         """
-        获取单条说说详情（含完整评论、转发、图片、视频等）
+        获取单条说说详情（含完整评论、转发、图片、视频等）。
+
+        路由顺序（按实机可用性）：
+        1. h5 msgdetail_v6（当前环境实测可用，评论 tid 为帖内短楼层号）
+        2. PC emotion_cgi_getdetailv6（评论含真实 commentid，供删除/回复定位；多数环境不可用）
+        3. mobile detail（多数环境不可用）
+        PC/mobile 仅作快速兜底：空响应只试 1 次，不累进重试，避免白等。
         """
         ctx = await self.session.get_ctx()
-        raw = await self.request(
-            "GET",
-            self.DETAIL_URL,
-            params={
-                "uin": post.uin,
-                "tid": post.tid,
-                "format": "jsonp",
-                "g_tk": ctx.gtk2,
-            },
+        errors: list[str] = []
+
+        # 方法1: h5 msgdetail_v6（当前环境唯一实测可行的详情接口）
+        try:
+            raw1 = await self.request(
+                "GET",
+                self.DETAIL_URL,
+                params={
+                    "uin": post.uin,
+                    "tid": post.tid,
+                    "format": "jsonp",
+                    "g_tk": ctx.gtk2,
+                },
+            )
+            if raw1.get("code") == 0 or raw1.get("msglist") or raw1.get("data"):
+                logger.info(f"QZone详情成功: route=h5 post={post.tid}")
+                return ApiResponse.from_raw(raw1)
+            errors.append(f"h5: code={raw1.get('code')} msg={raw1.get('msg') or raw1.get('message')}")
+        except Exception as e:
+            errors.append(f"h5: {e}")
+
+        # 方法2: PC getdetailv6（快速兜底，空响应只试 1 次）
+        try:
+            raw2 = await self.request(
+                "POST",
+                self.DETAIL_PC_URL,
+                params={"g_tk": ctx.gtk2},
+                data={
+                    "uin": post.uin,
+                    "tid": post.tid,
+                    "format": "json",
+                    "hostuin": ctx.uin,
+                    "qzreferrer": f"https://user.qzone.qq.com/{ctx.uin}/main",
+                },
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+                    "Referer": f"https://user.qzone.qq.com/{post.uin}",
+                    "Origin": "https://user.qzone.qq.com",
+                },
+                empty_retry_limit=1,
+            )
+            if raw2.get("code") == 0 or raw2.get("ret") == 0 or raw2.get("msglist") or raw2.get("data"):
+                logger.info(f"QZone详情成功: route=pc post={post.tid}")
+                return ApiResponse.from_raw(raw2)
+            errors.append(f"pc: code={raw2.get('code')} msg={raw2.get('msg') or raw2.get('message')}")
+        except Exception as e:
+            errors.append(f"pc: {e}")
+
+        # 方法3: mobile detail（快速兜底，空响应只试 1 次）
+        try:
+            raw3 = await self.request(
+                "GET",
+                self.DETAIL_MOBILE_URL,
+                params={
+                    "g_tk": ctx.gtk2,
+                    "uin": post.uin,
+                    "cellid": post.tid,
+                    "format": "json",
+                },
+                headers={
+                    "User-Agent": _MOBILE_UA,
+                    "Referer": "https://mobile.qzone.qq.com",
+                    "Accept": "application/json, text/plain, */*",
+                    "X-Requested-With": "XMLHttpRequest",
+                },
+                empty_retry_limit=1,
+            )
+            if raw3.get("code") == 0 or raw3.get("data"):
+                logger.info(f"QZone详情成功: route=mobile post={post.tid}")
+                return ApiResponse.from_raw(raw3)
+            errors.append(f"mobile: code={raw3.get('code')} msg={raw3.get('msg') or raw3.get('message')}")
+        except Exception as e:
+            errors.append(f"mobile: {e}")
+
+        logger.warning(f"QZone详情全部失败: {' | '.join(errors)}")
+        return ApiResponse(
+            ok=False,
+            code=-1,
+            message="; ".join(errors) or "获取详情失败",
+            data={},
+            raw={},
         )
-        return ApiResponse.from_raw(raw)
 
     async def get_recent_feeds(self, page: int = 1) -> ApiResponse:
         """

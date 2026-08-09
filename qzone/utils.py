@@ -67,6 +67,11 @@ async def download_file(url: str, timeout: int = 60, max_retries: int = 3) -> Op
                         data = await resp.read()
                         logger.info(f"图片下载成功: {url} ({len(data)} bytes)")
                         return data
+                    elif resp.status == 400:
+                        # rkey 过期 / 签名失效：重试同一 URL 无意义（NapCat #190/#265），
+                        # 快速失败交由上层 get_msg 续命或降级，避免 3 次 × 2s 白等。
+                        logger.warning(f"下载失败 (HTTP 400，链接可能已过期): {url}")
+                        return None
                     else:
                         logger.warning(f"下载失败 (HTTP {resp.status}): {url}")
         except asyncio.TimeoutError:

@@ -213,6 +213,32 @@ class QzoneParser:
                 rt_con = msg.get("rt_con", {}).get("content", "")
                 # 提取评论
                 comments = Comment.build_list(msg.get("commentlist") or [])
+                # 提取点赞信息（部分接口在 likeinfo 内联返回，未内联时由 view 调 get_like_list 补充）
+                likeinfo = msg.get("likeinfo") or {}
+                like_uin_info = likeinfo.get("like_uin_info") or []
+                like_users = [
+                    str(u.get("nick") or u.get("fuin") or "")
+                    for u in like_uin_info
+                    if isinstance(u, dict) and (u.get("nick") or u.get("fuin"))
+                ]
+                like_count = int(
+                    likeinfo.get("total_num")
+                    or likeinfo.get("total_number")
+                    or len(like_users)
+                    or 0
+                )
+                # 点赞 key：取列表接口（get_like_list_app）必需，优先用说说返回的真实 key，
+                # 避免手拼 unikey 在 appid 非 311 时说说不适用导致点赞列表不全
+                like_key = str(
+                    msg.get("curlikekey")
+                    or msg.get("orglikekey")
+                    or ""
+                )
+                # 当前登录者是否已赞（兼容多种字段名；仅作 view 补偿的辅助，主来源为本地点赞记录）
+                liked_flag = (
+                    msg.get("isliked", msg.get("isLiked", msg.get("liked", msg.get("is_liked"))))
+                )
+                is_liked = liked_flag in (1, True, "1")
                 # 构造Post对象，tid强制转为字符串
                 tid = str(msg.get("tid", ""))
                 if tid == "":
@@ -230,6 +256,10 @@ class QzoneParser:
                     create_time=msg.get("created_time", 0),
                     rt_con=rt_con,
                     comments=comments,
+                    like_count=like_count,
+                    like_users=like_users,
+                    like_key=like_key,
+                    is_liked=is_liked,
                     extra_text=msg.get("source_name"),
                 )
                 posts.append(post)

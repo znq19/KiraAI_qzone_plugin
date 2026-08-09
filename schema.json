@@ -130,6 +130,11 @@
         "default": false,
         "hint": "评论说说后自动顺带点赞（由插件直接执行，AI 无需再调用点赞工具）。群聊指令模式和后台直接生成模式均生效。"
     },
+    "like_users_display_max": {
+        "type": "number",
+        "default": 5,
+        "hint": "查看说说时展示点赞人昵称的数量上限（默认 5，模拟空间页「xx等人觉得很赞」；总数不受影响，只影响展示几个昵称）。"
+    },
     "backend_llm_model": {
         "type": "model_select",
         "model_type": "llm",

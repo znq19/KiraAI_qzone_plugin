@@ -48,8 +48,9 @@ IMAGE_REGISTRY_CAP = 20
 
 # 登录失效后强制刷新的最小间隔（防失效风暴）
 FORCE_REFRESH_MIN_INTERVAL = 3
-# 常规刷新节流
-REFRESH_THROTTLE = 300
+# 常规刷新失败冷却：失败后该秒数内不再主动骚扰 OneBot（避免 get 风暴），
+# 但下个用即刷/周期任务到来时会自动再试，OneBot 恢复后即可续回来。
+REFRESH_THROTTLE = 10
 
 
 class QzonePlugin(BasePlugin):
@@ -90,6 +91,8 @@ class QzonePlugin(BasePlugin):
         self.session: Optional[QzoneSession] = None
         self.api: Optional[QzoneAPI] = None
         self.my_uin: Optional[int] = None
+        # 自己的昵称缓存（从 OneBot get_stranger_info 懒加载；用于点赞列表展示自己昵称，防「我」昵称诈骗）
+        self._my_nickname: str = ""
 
         self.scheduler = AsyncIOScheduler()
 
@@ -99,6 +102,11 @@ class QzonePlugin(BasePlugin):
         self.auto_reply_schedule = cfg.get("auto_reply_schedule", "")
         self.auto_reply_enabled = cfg.get("auto_reply_enabled", False)
         self.like_when_comment = cfg.get("like_when_comment", False)
+        # view 展示点赞人昵称的数量上限（默认 5，模拟空间页「xx等人觉得很赞」）
+        try:
+            self.like_users_display_max = max(1, int(cfg.get("like_users_display_max", 5) or 5))
+        except (TypeError, ValueError):
+            self.like_users_display_max = 5
 
         # 旧定时配置（向后兼容）
         self.auto_publish_cron = cfg.get("auto_publish_cron", "")
@@ -138,6 +146,8 @@ class QzonePlugin(BasePlugin):
         self._cookie_refresh_lock = asyncio.Lock()
         self._last_cookie_refresh = 0.0
         self._cookie_refresh_task: Optional[asyncio.Task] = None
+        # 启动/重载时 get_cookies 失败的延迟自动重试任务（避免重载瞬间 OneBot 未就绪导致插件判死）
+        self._startup_retry_task: Optional[asyncio.Task] = None
 
         # 群名缓存：{gid: (name, timestamp)}
         self._group_name_cache: dict[str, tuple[str, float]] = {}
@@ -285,6 +295,9 @@ class QzonePlugin(BasePlugin):
         """从 OneBot 获取最新 Cookie 并原地更新会话。
 
         返回 True 表示凭证已更新。失败时保留现有会话（last-good），不置失败标记。
+        无论成败都会推进 _last_cookie_refresh（冷却），防止 get_cookies 失败风暴：
+        失败后 REFRESH_THROTTLE(10s) 内不再主动骚扰 OneBot，让现有 Cookie 继续干活；
+        下个用即刷/周期任务/启动重试到来时会自动再试，OneBot 恢复后即可续回来。
         """
         if not self.auto_refresh:
             return False
@@ -300,6 +313,8 @@ class QzonePlugin(BasePlugin):
                 return False
             new_cookie = await self._get_cookie_from_onebot()
             if not new_cookie:
+                # 失败同样推进冷却：避免每次调用都打爆 OneBot（get_cookies 超时会阻塞调用链）
+                self._last_cookie_refresh = now
                 logger.warning("从 OneBot 获取 Cookie 失败，保留现有会话")
                 return False
             try:
@@ -314,8 +329,31 @@ class QzonePlugin(BasePlugin):
                 logger.info("已从 OneBot 获取最新 Cookie 并原地更新会话")
                 return True
             except Exception as e:
+                self._last_cookie_refresh = now
                 logger.error(f"应用新 Cookie 失败: {e}")
                 return False
+
+    async def _retry_startup_cookie(self):
+        """启动/重载时 get_cookies 失败后的延迟自动重试（15s/30s/60s/120s 递增，最多 4 次）。
+
+        重载瞬间 OneBot 适配器常尚未就绪（login_success_event 未触发），get_cookies 快速失败；
+        该任务在后台按递增间隔重试，OneBot 一恢复即可续回，成功后自动停止。
+        """
+        try:
+            for attempt, delay in enumerate((15, 30, 60, 120), 1):
+                await asyncio.sleep(delay)
+                if self.session is not None and not self._init_failed:
+                    return  # 会话已就绪（可能被其它路径恢复），无需再试
+                try:
+                    if await self._refresh_cookie(force=False):
+                        logger.info(f"启动 Cookie 延迟重试成功（第 {attempt} 次，{delay}s 后）")
+                        return
+                except Exception as e:
+                    logger.debug(f"启动 Cookie 延迟重试失败（第 {attempt} 次）: {e}")
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            logger.warning(f"启动 Cookie 延迟重试任务异常退出: {e}")
 
     async def _handle_auth_expired(self) -> bool:
         """提供给 QzoneHttpClient 的登录失效回调"""
@@ -352,6 +390,14 @@ class QzonePlugin(BasePlugin):
             except Exception as e:
                 logger.error(f"刷新 Cookie 异常: {e}")
         if self.api is None:
+            # 启动自愈窗口内（后台重试任务仍在跑）：明确提示稍后再试，
+            # 不要用空 Cookie 反复构建注定失败的会话。
+            if (
+                self.auto_refresh
+                and self._startup_retry_task is not None
+                and not self._startup_retry_task.done()
+            ):
+                raise RuntimeError("QQ空间 Cookie 正在后台自动获取中，请稍后再试")
             await self._reinit_session()
             return
         # api 存在但曾被标记失败：先验证旧会话是否其实还可用
@@ -381,6 +427,11 @@ class QzonePlugin(BasePlugin):
             self.api.on_auth_expired = self._handle_auth_expired
             ctx = await self.session.get_ctx()
             self.my_uin = ctx.uin
+            # 空/无效 Cookie 也能构造出 session，但解析不到 uin 时接口全部不可用；
+            # 必须在这里显式失败并保持 _init_failed，让 _ensure_api 持续走刷新路径自愈，
+            # 避免"空会话假成功"导致功能静默不可用。
+            if not self.my_uin:
+                raise RuntimeError("Cookie 中未解析到有效 QQ 号（uin），会话不可用")
             logger.info(f"QQ空间 API 初始化成功，当前账号: {self.my_uin}")
             self._init_failed = False
         except Exception as e:
@@ -449,17 +500,30 @@ class QzonePlugin(BasePlugin):
         except Exception as e:
             logger.error(f"查找 QQ 适配器时出错: {e}")
 
-    async def _call_onebot_action(self, action: str, params: dict):
+    async def _call_onebot_action(self, action: str, params: dict, timeout: float = 10.0):
         self._ensure_ada()
         if not self._ada_obj:
             raise RuntimeError("无法获取 QQ 适配器")
         ob_client = self._ada_obj.get_client()
-        res = await ob_client.send_action(action, params)
+        # NapCat send_action 第一步会硬编码等待 login_success_event（最长 10s），
+        # 而该事件仅在收到 lifecycle 元事件时 set——NapCat 偶发不发送 lifecycle 时，
+        # 所有 send_action 都会白白卡满 10 秒。这里预检：事件未触发则快速失败，
+        # 避免 OneBot 偶发抽风拖死插件整条调用链。
+        login_ev = getattr(ob_client, "login_success_event", None)
+        if login_ev is not None and not login_ev.is_set():
+            try:
+                # 给 1 秒窗口：若此刻事件即将触发则让它通过，否则快速失败
+                await asyncio.wait_for(login_ev.wait(), timeout=1)
+            except asyncio.TimeoutError:
+                raise TimeoutError("OneBot 登录成功事件未触发（适配器可能未就绪或 NapCat 未发送 lifecycle）")
+        res = await ob_client.send_action(action, params, timeout=timeout)
         return res
 
     async def _get_cookie_from_onebot(self) -> Optional[str]:
         try:
-            data = await self._call_onebot_action("get_cookies", {"domain": "user.qzone.qq.com"})
+            # send_action 默认超时 10s；Cookie 刷新属"锦上添花"，给 5s 快速失败，
+            # 避免 OneBot 繁忙时把整条发布/评论链路拖死。
+            data = await self._call_onebot_action("get_cookies", {"domain": "user.qzone.qq.com"}, timeout=5)
             if data.get("status") != "ok":
                 logger.error(f"oneBot 返回错误: {data}")
                 return None
@@ -469,6 +533,12 @@ class QzonePlugin(BasePlugin):
                 return None
             logger.info("成功从 oneBot 获取 Cookie")
             return cookie_str
+        except TimeoutError as e:
+            # 区分：OneBot 未就绪（login_success_event 未触发）≠ Cookie 失效。
+            # 现有会话可能完全可用，只是拿不到新的——保留现有会话继续干活，
+            # 下个用即刷/周期任务会再试，OneBot 恢复即续回，无需开关适配器。
+            logger.warning(f"从 oneBot 获取 Cookie 超时（OneBot 可能未就绪，保留现有会话）: {e}")
+            return None
         except Exception as e:
             logger.error(f"从 oneBot 获取 Cookie 失败: {e}")
             return None
@@ -477,16 +547,26 @@ class QzonePlugin(BasePlugin):
     async def initialize(self):
         self._load_state()
 
+        refresh_ok = False
         if self.auto_refresh:
             try:
-                await self._refresh_cookie(force=True)
+                refresh_ok = await self._refresh_cookie(force=True)
             except Exception as e:
                 logger.warning(f"启动时刷新 Cookie 失败: {e}")
+                refresh_ok = False
+            # 启动/重载瞬间 OneBot 适配器可能尚未就绪（login_success_event 未触发），
+            # get_cookies 会快速失败——此时不要直接判死：安排延迟自动重试，
+            # OneBot 恢复后几十秒内自动续回，无需手动重载。
+            if not refresh_ok and self.session is None:
+                if self._startup_retry_task is None or self._startup_retry_task.done():
+                    self._startup_retry_task = asyncio.create_task(self._retry_startup_cookie())
+                    logger.info("启动 Cookie 获取失败，已安排延迟自动重试（15s/30s/60s/120s 递增，最多 4 次）")
 
         if self.session is None:
             if not self.cookies_str:
-                logger.error("未提供 Cookie 且自动刷新不可用，插件功能将不可用直至 Cookie 就绪")
-                self._init_failed = True
+                if self._startup_retry_task is None or self._startup_retry_task.done():
+                    logger.error("未提供 Cookie 且自动刷新不可用，插件功能将不可用直至 Cookie 就绪")
+                    self._init_failed = True
             else:
                 try:
                     await self._reinit_session()
@@ -508,6 +588,14 @@ class QzonePlugin(BasePlugin):
                 except asyncio.CancelledError:
                     pass
             self._cookie_refresh_task = None
+
+            if self._startup_retry_task and not self._startup_retry_task.done():
+                self._startup_retry_task.cancel()
+                try:
+                    await self._startup_retry_task
+                except asyncio.CancelledError:
+                    pass
+            self._startup_retry_task = None
 
             if self.api:
                 await self.api.close()
@@ -873,7 +961,7 @@ class QzonePlugin(BasePlugin):
         try:
             await self._ensure_api()
             if self.task_group_ids or self.task_private_ids:
-                instruction = "【评论任务】请对最近的好友（不包括自己）说说进行评论，自然一点。严禁内容重复和复读。注意，检查用户昵称来不要评论自己发布的QQ说说，优先没有评论过的内容，该内容时间戳与当前系统时间戳不得超过7天，否则不评论。"
+                instruction = "【评论任务】请对最近的好友（不包括自己）说说进行评论，自然一点和简洁（0-15字内）。严禁内容重复和复读。注意，检查用户昵称来不要评论自己发布的QQ说说，优先没有评论过的内容，该内容时间戳与当前系统时间戳不得超过7天，否则不评论。"
                 await self._send_task_instruction(instruction, with_place=False)
                 return
             await self._legacy_auto_comment()
@@ -891,7 +979,7 @@ class QzonePlugin(BasePlugin):
                 return
             selected = random.sample(posts, min(self.max_comments_per_cycle, len(posts)))
             for post in selected:
-                prompt = f"根据以下说说内容，生成一条简短评论（10-20字）：\n{post.text}"
+                prompt = f"根据以下说说内容，生成一条简洁评论（0-15字）：\n{post.text}"
                 # 可选：识图后评论
                 if self.auto_comment_image_desc and post.images and self.qzone_image_desc_enabled:
                     desc = await self._describe_image_url(post.images[0])
@@ -901,12 +989,12 @@ class QzonePlugin(BasePlugin):
                 if not comment_text:
                     continue
                 try:
-                    await self._comment(post, comment_text)
-                    logger.info(f"自动评论成功并已确认落地: {post.tid} -> {comment_text}")
+                    result = await self._comment(post, comment_text)
+                    logger.info(f"自动评论成功: {post.tid} -> {comment_text}")
                 except Exception as e:
-                    logger.warning(f"自动评论失败或未落地: {post.tid} -> {e}")
+                    logger.warning(f"自动评论失败: {post.tid} -> {e}")
                     continue
-                if self.like_when_comment:
+                if self.like_when_comment and "未重复提交" not in result:
                     like_resp = await self.api.like(post, abstime=post.create_time)
                     if like_resp.ok:
                         logger.info(f"自动点赞成功: {post.tid}")
@@ -923,7 +1011,7 @@ class QzonePlugin(BasePlugin):
         try:
             await self._ensure_api()
             if self.task_group_ids or self.task_private_ids:
-                instruction = "【回复任务】请回复你最近说说下的新评论，使用qzone_reply_comment和评论自身的ID、UIN准确回复，target_id为自己的QQ号。自然一点，严禁内容重复和复读。根据评论作者UIN不回复自己，优先没有回复过的用户和新回复，否则不回复。"
+                instruction = "【回复任务】请回复你最近说说下的新评论，使用qzone_reply_comment和评论自身的ID、UIN准确回复，target_id为自己的QQ号。自然一点和简洁（0-15字内），严禁内容重复和复读。根据评论作者UIN不回复自己，优先没有回复过的用户和新回复，否则不回复。"
                 await self._send_task_instruction(instruction, with_place=False)
                 return
             await self._legacy_auto_reply()
@@ -955,7 +1043,7 @@ class QzonePlugin(BasePlugin):
                     if reply_key in self.replied_comments:
                         continue
                     _, prompt_content = self._parse_comment_content(comment.content)
-                    prompt = f"用户 {comment.nickname} 评论了你的说说：{prompt_content}，请生成一条友好回复（10-30字）。"
+                    prompt = f"用户 {comment.nickname} 评论了你的说说：{prompt_content}，请生成一条简洁回复（0-15字）。"
                     reply_text = await self._call_llm(prompt, await self._get_persona_content(), use_backend_model=True)
                     if not reply_text:
                         continue
@@ -1328,6 +1416,11 @@ class QzonePlugin(BasePlugin):
                 if entry.get("source") == "url":
                     url = entry.get("url", "")
                     if url:
+                        # 历史 URL 的 rkey 有效期约 1 小时，过期后下载必 400；
+                        # 先用 get_msg 按 message_id 续命换新签名 URL，失败再退回原 URL。
+                        if entry.get("msg_id") and await self._refresh_image_url(entry):
+                            url = entry.get("url") or url
+                            logger.info(f"历史图片已续命成功: {url[:80]}")
                         paths.append(url)
                     continue
                 elem: Image = entry["elem"]
@@ -1419,6 +1512,44 @@ class QzonePlugin(BasePlugin):
             result += f"（注意：{resp.message}）"
         return result
 
+    async def _get_my_nickname(self) -> str:
+        """懒加载自己的昵称，失败返回空串（调用方回退「我」）。
+
+        来源优先级：
+        1. OneBot get_stranger_info（QQ 主协议数据，NapCat/LLOneBot 必支持，最可靠）
+        2. QZone cgi_personal_card（空间接口，部分环境不可用）
+        """
+        if self._my_nickname:
+            return self._my_nickname
+        if not self.my_uin:
+            return ""
+        # 优先 OneBot 主协议
+        try:
+            data = await self._call_onebot_action(
+                "get_stranger_info", {"user_id": int(self.my_uin)}, timeout=5
+            )
+            if data.get("status") == "ok":
+                info = data.get("data") or {}
+                nick = str(info.get("nickname") or info.get("nick") or "")
+                if nick:
+                    self._my_nickname = nick
+                    logger.info(f"已获取自己的昵称(OneBot): {nick}")
+                    return nick
+        except Exception as e:
+            logger.debug(f"OneBot 获取自己昵称失败: {e}")
+        # 回退 QZone 空间接口
+        if self.api is not None:
+            try:
+                resp = await self.api.get_user_info(str(self.my_uin))
+                if resp.ok:
+                    nick = str((resp.data or {}).get("nickname") or "")
+                    if nick:
+                        self._my_nickname = nick
+                        logger.info(f"已获取自己的昵称(cgi_personal_card): {nick}")
+            except Exception as e:
+                logger.debug(f"cgi_personal_card 获取自己昵称失败: {e}")
+        return self._my_nickname
+
     async def _get_feeds(self, target_id: Optional[str] = None, num: int = 1) -> list[QzonePost]:
         await self._ensure_api()
         if target_id:
@@ -1467,42 +1598,29 @@ class QzonePlugin(BasePlugin):
         return parsed_posts[0]
 
     async def _comment(self, post: QzonePost, content: str) -> str:
-        """提交评论并回读确认；只有确认新增评论后才能报告成功或继续点赞。"""
+        """提交评论。接口返回成功即视为成功（与其他操作统一判定，不再回读确认）。
+
+        提交前做幂等检查（本地比对，零 token 消耗）：若该说说下已存在
+        自己相同内容的评论，直接返回成功，避免 LLM 重试造成重复评论。
+        """
         await self._ensure_api()
         if not self.my_uin:
             raise RuntimeError("无法确认当前登录 QQ，已取消评论")
 
-        before_post = await self._get_detail_post(post)
-        before_count = self._count_own_comment(before_post, content)
+        # 幂等检查：本地遍历评论比对（不调 LLM，不消耗 token）
+        try:
+            before_post = await self._get_detail_post(post)
+            if self._count_own_comment(before_post, content) > 0:
+                logger.info(f"幂等命中：该说说已存在相同评论，跳过重复提交: {post.tid}")
+                return "评论成功（该说说已存在相同内容的评论，未重复提交）"
+        except Exception as e:
+            logger.debug(f"评论前幂等检查失败（继续提交）: {e}")
 
         resp = await self.api.comment(post, content)
         if not resp.ok:
             raise RuntimeError(f"评论接口失败: {resp.message}")
-
-        last_error = ""
-        for delay in (0, 1, 2, 4):
-            if delay:
-                await asyncio.sleep(delay)
-            try:
-                current_post = await self._get_detail_post(post)
-                current_count = self._count_own_comment(current_post, content)
-                if current_count > before_count:
-                    logger.info(
-                        "QZone评论落地确认: post=%s own_uin=%s before=%s after=%s",
-                        post.tid,
-                        self.my_uin,
-                        before_count,
-                        current_count,
-                    )
-                    return "评论成功（已确认落地）"
-                last_error = f"匹配评论数未增加（{before_count}->{current_count}）"
-            except Exception as e:
-                last_error = str(e)
-
-        raise RuntimeError(
-            "评论接口返回成功，但详情回读未发现新增评论；"
-            f"不会执行自动点赞。{last_error}"
-        )
+        logger.info(f"QZone评论提交成功: post={post.tid} content={content[:40]}")
+        return "评论成功"
 
     async def _delete(self, tid: str) -> str:
         await self._ensure_api()
@@ -1536,7 +1654,7 @@ class QzonePlugin(BasePlugin):
         await self._ensure_api()
         if not content:
             _, prompt_content = self._parse_comment_content(comment.content)
-            prompt = f"用户 {comment.nickname} 评论了你的说说：{prompt_content}，请生成一条友好回复（10-30字）。"
+            prompt = f"用户 {comment.nickname} 评论了你的说说：{prompt_content}，请生成一条简洁回复（0-15字）。"
             content = await self._call_llm(prompt, await self._get_persona_content(), use_backend_model=False)
             if not content:
                 raise RuntimeError("生成回复内容为空")
@@ -1610,8 +1728,11 @@ class QzonePlugin(BasePlugin):
     def _format_comment_line(cls, comment: QzoneComment, label: str, indent: str, time_str: str) -> str:
         target, content = cls._parse_comment_content(comment.content)
         relation = f" 回复 {target}" if target else ""
+        # 优先展示真实评论 ID（长数字/含 _r_ 的合成 id），删除/回复接口需要它；
+        # 短楼层号 tid 仅作为展示辅助，避免 AI 把楼层号当真实 ID 传给删除接口。
+        cid = comment.comment_id or str(comment.tid)
         return (
-            f"{indent}└ [{label} ID:{comment.tid} UIN:{comment.uin}] "
+            f"{indent}└ [{label} ID:{cid} UIN:{comment.uin}] "
             f"{comment.nickname}{relation} [{time_str}]: {content}"
         )
 
@@ -1751,11 +1872,16 @@ class QzonePlugin(BasePlugin):
                 else:
                     valid_sources = valid_sources[:task_maximum]
             # 吸附兑底：未指定图片且开启吸附模式时，自动抓最近一张图
-            # （吸附图下载失败会降级为纯文字发布，保持“有时配有时不配”的随机感）
+            # （吸附图下载失败会降级为纯文字发布，保持"有时配有时不配"的随机感）
             allow_drop = False
-            if (
-                task_policy is None
-                and not valid_sources
+            if task_policy is not None:
+                # 定时任务：已通过 _fill_scheduled_publish_sources 尽力补足目标张数
+                # （清单 → 近期图片 阶梯）；若图片仍全部获取失败，降级为纯文字发布，
+                # 避免整个发布失败导致 LLM 反复重试空转。允许下载失败时再降级，
+                # 不影响"尽可能按目标数量配图"的优先级。
+                allow_drop = True
+            elif (
+                not valid_sources
                 and self.auto_attach_recent_image
             ):
                 valid_sources = await self._fetch_recent_images_for_event(event, max_count=1)
@@ -1799,11 +1925,86 @@ class QzonePlugin(BasePlugin):
                         line += f"\n配图x{img_count}（调用 qzone_describe_image(target_id='{p.uin}', tid='{p.tid}', index=第几张) 可查看图片内容）"
                     else:
                         line += f"\n配图x{img_count}"
-                if p.comments:
+                # 评论直接用详情接口拉取（h5 msgdetail_v6 为实测唯一稳定路径，
+                # 不再尝试 PC/mobile 评论接口——它们在该环境返回空/参数错误，
+                # 避免 view 链路先报错再回退的不优雅行为）
+                full_post = None
+                try:
+                    detail_post = await self._get_detail_post(p)
+                    if detail_post.comments:
+                        full_post = detail_post
+                except Exception as e:
+                    logger.debug(f"view 拉取详情评论失败（回退列表评论）: {e}")
+                comments = (full_post or p).comments
+                # 点赞信息：全部来自真实接口（get_like_list_app 的 like_uin_info/total_number/is_dolike）
+                like_count = 0
+                like_users: list[str] = []
+                liked_uins: list[str] = []
+                is_dolike = False
+                try:
+                    like_resp = await self.api.get_like_list(p, query_count=10)
+                    if like_resp.ok:
+                        like_data = like_resp.data or {}
+                        like_users = [
+                            str(u.get("nick") or u.get("fuin") or "")
+                            for u in (like_data.get("like_uin_info") or [])
+                            if isinstance(u, dict) and (u.get("nick") or u.get("fuin"))
+                        ]
+                        liked_uins = list(like_data.get("like_uins") or [])
+                        like_count = int(
+                            like_data.get("total_number") or len(like_users) or 0
+                        )
+                        is_dolike = bool(like_data.get("is_dolike"))
+                except Exception as e:
+                    logger.debug(f"view 拉取点赞列表失败: {e}")
+                if not like_users:
+                    # get_like_list 失败/为空时回退 detail 内联 likeinfo（仍为接口数据）
+                    like_count = (full_post or p).like_count
+                    like_users = list((full_post or p).like_users)
+                # 自己是否已赞：get_like_list_app 的 is_dolike 为接口真实字段（CSDN 教程确认），
+                # 辅以 msglist isLiked / detail isliked。不用任何本地记录。
+                msg_liked = bool(getattr(p, "is_liked", False))
+                detail_liked = bool(getattr(full_post, "is_liked", False)) if full_post else False
+                self_liked = is_dolike or msg_liked or detail_liked
+                logger.info(
+                    f"view 已赞状态: tid={p.tid} is_dolike={is_dolike} "
+                    f"msglist_is_liked={getattr(p, 'is_liked', None)} "
+                    f"detail_is_liked={detail_liked} self_liked={self_liked}"
+                )
+                # 接口确认：like_uin_info 不含当前登录者（"除我以外"），
+                # 若接口确认自己已赞（is_dolike）且列表没有自己 → 补自己的真实昵称（仍为接口事实的组合）
+                if (
+                    self_liked
+                    and liked_uins
+                    and self.my_uin
+                    and str(self.my_uin) not in liked_uins
+                ):
+                    # 显示自己的真实昵称并加「（我）」标记（如「General New（我）」）：
+                    # 保留真实昵称防昵称诈骗，同时明确这是 bot 自己；昵称获取失败才回退「我」
+                    nick = await self._get_my_nickname()
+                    my_nick = f"{nick}（我）" if nick else "我"
+                    like_users.append(my_nick)
+                    if like_count <= len(liked_uins):
+                        like_count += 1
+                if like_count or like_users:
+                    # 格式：已赞N人：周武 觉得很赞（前缀总数 + QQ 原生表达；
+                    # 超过配置上限时「周武、C7 等人 觉得很赞」，不再重复数字）
+                    n = like_count or len(like_users)
+                    shown = like_users[:self.like_users_display_max]
+                    if n == 1 and shown:
+                        like_text = f"已赞1人：{shown[0]} 觉得很赞"
+                    elif shown and len(shown) >= n:
+                        like_text = f"已赞{n}人：{'、'.join(shown)} 觉得很赞"
+                    elif shown:
+                        like_text = f"已赞{n}人：{'、'.join(shown)} 等人 觉得很赞"
+                    else:
+                        like_text = f"已赞{n}人"
+                    line += f"\n{like_text}"
+                if comments:
                     comment_lines = []
                     replies_by_parent: dict[int, list[QzoneComment]] = {}
                     main_comments = []
-                    for cmt in p.comments:
+                    for cmt in comments:
                         if cmt.parent_tid is None:
                             main_comments.append(cmt)
                         else:
@@ -1820,7 +2021,7 @@ class QzonePlugin(BasePlugin):
                             shown_comments.add(id(reply))
 
                     # 防御性展示没有匹配主评论的回复；不递归推断不存在的更深层级。
-                    for cmt in p.comments:
+                    for cmt in comments:
                         if id(cmt) in shown_comments:
                             continue
                         cmt_time_str = cmt.create_time_str or self._format_time(cmt.create_time)
@@ -1829,7 +2030,7 @@ class QzonePlugin(BasePlugin):
                         comment_lines.append(self._format_comment_line(cmt, label, indent, cmt_time_str))
                         shown_comments.add(id(cmt))
                     if comment_lines:
-                        line += "\n评论区：\n" + "\n".join(comment_lines[:20])
+                        line += "\n评论区：\n" + "\n".join(comment_lines[:30])
                 lines.append(line)
             return "\n---\n".join(lines)
         except Exception as e:
@@ -1905,39 +2106,54 @@ class QzonePlugin(BasePlugin):
 
     @register_tool(
         name="qzone_like",
-        description="给指定的说说点赞",
+        description="给指定说说点赞，或取消已点的赞（同一工具两职）。用户要求点赞（如“赞一下/点个赞”）用默认 action=like；用户要求取消点赞（如“取消赞/去掉赞/取消点赞”）时必须传 action=unlike。",
         params={
             "type": "object",
             "properties": {
                 "target_id": {"type": "string", "description": "目标QQ号"},
-                "tid": {"type": "string", "description": "说说ID"}
+                "tid": {"type": "string", "description": "说说ID"},
+                "action": {"type": "string", "description": "操作类型：like=点赞（默认），unlike=取消点赞", "enum": ["like", "unlike"]}
             },
             "required": ["target_id", "tid"]
         }
     )
-    async def tool_like(self, event: KiraMessageBatchEvent, target_id: str, tid: str):
+    async def tool_like(self, event: KiraMessageBatchEvent, target_id: str, tid: str, action: str = "like"):
         # 不检查黑名单，用户主动触发不受限制
         if not await self._check_master(event):
             return "抱歉，只有主人才能使用此功能。"
         await self._ensure_api()
         try:
             post = QzonePost(uin=int(target_id), tid=tid)
-            # 先取详情：获得说说发布时间（点赞必需参数）并做已赞检测
+            # 先取详情：获得说说发布时间（点赞/取消赞参数需要）并做已赞检测（避免无意义请求）
             detail_resp = await self.api.get_detail(post)
+            liked = None
             if detail_resp.ok:
                 raw = detail_resp.data or {}
                 liked_flag = raw.get("isliked", raw.get("isLiked", raw.get("liked")))
-                if liked_flag in (1, True, "1"):
-                    return "这条说说已经赞过了。"
+                liked = liked_flag in (1, True, "1")
                 parsed_posts = QzoneParser.parse_feeds([raw])
                 if parsed_posts:
                     post = parsed_posts[0]
                     if not post.uin:
                         post.uin = int(target_id)
+
+            if action == "unlike":
+                # 已赞检测（isliked）仅作参考，不作为取消的拦截依据：
+                # h5 详情的 isliked 存在滞后（刚点赞成功详情仍可能显示未赞），
+                # 拦截会导致取消操作被误挡；取消本身幂等无害，直接执行。
+                resp = await self.api.unlike(post, abstime=post.create_time)
+                if not resp.ok:
+                    return f"取消点赞失败：{resp.message}"
+                return "取消点赞成功"
+            # 默认：点赞
+            if liked is True:
+                return "这条说说已经赞过了。"
             result = await self._like(post)
             return result
         except Exception as e:
-            return f"点赞失败：{e}"
+            return f"点赞/取消点赞失败：{e}"
+        except Exception as e:
+            return f"取消点赞失败：{e}"
 
     @register_tool(
         name="qzone_comment",
@@ -1966,19 +2182,20 @@ class QzonePlugin(BasePlugin):
                     parsed_posts = QzoneParser.parse_feeds([detail_resp.data])
                     if parsed_posts:
                         full_post = parsed_posts[0]
-                        prompt = f"根据以下说说内容，生成一条简短评论（10-20字）：\n{full_post.text}"
+                        prompt = f"根据以下说说内容，生成一条简洁评论（0-15字）：\n{full_post.text}"
                         content = await self._call_llm(prompt, await self._get_persona_content(), use_backend_model=False)
                         if not content:
                             content = "赞一个！"
                 else:
-                    prompt = "为这条说说生成一条简短评论（10-20字）"
+                    prompt = "为这条说说生成一条简洁评论（0-15字）"
                     content = await self._call_llm(prompt, await self._get_persona_content(), use_backend_model=False)
                     if not content:
                         content = "赞一个！"
             post = QzonePost(uin=int(target_id), tid=tid)
             result = await self._comment(post, content)
-            # 评论后自动点赞（插件直接执行，无需 AI 再调一次工具）
-            if self.like_when_comment:
+            # 评论后自动点赞（插件直接执行，无需 AI 再调一次工具）。
+            # 幂等命中（已存在相同评论）时不重复点赞。
+            if self.like_when_comment and "未重复提交" not in result:
                 try:
                     like_post = full_post or post
                     if full_post is None:
@@ -2028,6 +2245,78 @@ class QzonePlugin(BasePlugin):
             return f"删除失败：{e}"
 
     @register_tool(
+        name="qzone_delete_comment",
+        description="删除指定评论（主评论或楼中回复均可）。支持删除自己空间说说下的任意评论，或删除自己发布在别人说说下的评论/回复。评论 ID 和作者 UIN 从 qzone_view 获取；楼中回复建议同时传 comment_uin 精确定位。",
+        params={
+            "type": "object",
+            "properties": {
+                "target_id": {"type": "string", "description": "说说作者的QQ号（删自己空间评论就填自己的QQ号）"},
+                "tid": {"type": "string", "description": "说说ID"},
+                "comment_id": {"type": "string", "description": "要删除的评论ID（主评论或楼中回复的ID均可）"},
+                "comment_uin": {"type": "string", "description": "评论作者QQ号（可选；楼中回复建议传，用于精确定位）"}
+            },
+            "required": ["target_id", "tid", "comment_id"]
+        }
+    )
+    async def tool_delete_comment(self, event: KiraMessageBatchEvent, target_id: str, tid: str, comment_id: str, comment_uin: str = ""):
+        # 不检查黑名单，用户主动触发不受限制
+        if not await self._check_master(event):
+            return "抱歉，只有主人才能使用此功能。"
+        await self._ensure_api()
+        try:
+            real_cid = str(comment_id)
+            # 删除前反查评论：优先用详情接口（h5 msgdetail_v6 实测唯一稳定路径）拉取
+            # 该说说的评论列表，按 ID/UIN 匹配；若详情返回的是短楼层号，直接用其删除
+            # （h5 域 delcomment_ugc 接受短楼层号 commentId）。
+            try:
+                matched = None
+                try:
+                    detail_resp = await self.api.get_detail(QzonePost(uin=int(target_id), tid=str(tid)))
+                    if detail_resp.ok:
+                        parsed_posts = QzoneParser.parse_feeds([detail_resp.data])
+                        if parsed_posts:
+                            matched = self._match_comment(parsed_posts[0].comments, comment_id, comment_uin)
+                except Exception as e:
+                    logger.debug(f"删除评论反查-详情接口失败: {e}")
+                if matched is not None and matched.comment_id:
+                    real_cid = matched.comment_id
+                    logger.info(
+                        f"删除评论反查真实 ID: {comment_id} -> {real_cid} "
+                        f"(post={tid} uin={target_id})"
+                    )
+                else:
+                    logger.info(
+                        f"删除评论未找到唯一匹配（可能为短楼层号），直接用原 ID 尝试: {comment_id} "
+                        f"post={tid} uin={target_id}"
+                    )
+            except Exception as e:
+                logger.debug(f"删除评论反查失败（继续用原 ID）: {e}")
+
+            resp = await self.api.delete_comment(
+                uin=str(target_id),
+                tid=str(tid),
+                comment_id=real_cid,
+                comment_uin=str(comment_uin or ""),
+            )
+            if not resp.ok:
+                return f"删除评论失败：{resp.message}"
+            return "评论删除成功"
+        except Exception as e:
+            return f"删除评论失败：{e}"
+
+    @staticmethod
+    def _match_comment(comments: List[QzoneComment], comment_id: str, comment_uin: str = "") -> Optional[QzoneComment]:
+        """按评论 ID（兼容真实 comment_id 与短楼层号 tid）和 UIN 匹配评论；0/多条返回 None。"""
+        matches = [
+            cmt for cmt in comments
+            if str(cmt.comment_id) == str(comment_id)
+            or str(cmt.tid) == str(comment_id)
+        ]
+        if comment_uin:
+            matches = [cmt for cmt in matches if str(cmt.uin) == str(comment_uin)]
+        return matches[0] if len(matches) == 1 else None
+
+    @register_tool(
         name="qzone_reply_comment",
         description="回复指定评论。先从 qzone_view 获取评论 ID 和 UIN；当同一说说内 ID 重复时必须同时传 comment_uin，避免回复错人。",
         params={
@@ -2069,7 +2358,7 @@ class QzonePlugin(BasePlugin):
             final_content = content
             if not final_content:
                 _, prompt_content = self._parse_comment_content(target_comment.content)
-                prompt = f"用户 {target_comment.nickname} 评论了你的说说：{prompt_content}，请生成一条友好回复（10-30字）。"
+                prompt = f"用户 {target_comment.nickname} 评论了你的说说：{prompt_content}，请生成一条简洁回复（0-15字）。"
                 final_content = await self._call_llm(prompt, await self._get_persona_content(), use_backend_model=False)
                 if not final_content:
                     return "生成回复内容为空"

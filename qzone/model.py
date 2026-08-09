@@ -169,6 +169,7 @@ class Comment(BaseModel):
     create_time: int
     create_time_str: str = ""
     tid: int = 0
+    comment_id: str = ""  # 真实评论 ID（长数字或含 _r_ 的合成 id，删除/回复用）
     parent_tid: Optional[int] = None  # 为 None 表示主评论
     source_name: str = ""
     source_url: str = ""
@@ -184,13 +185,24 @@ class Comment(BaseModel):
     @staticmethod
     def from_raw(raw: dict, parent_tid: Optional[int] = None) -> "Comment":
         """从原始字典构造 Comment"""
+        # 真实评论 ID：PC/详情接口通常带 commentid/cid；feeds3/msglist 可能只有短楼层号 tid。
+        raw_tid = raw.get("tid") or raw.get("id") or ""
+        comment_id = str(
+            raw.get("commentid") or raw.get("comment_id") or raw.get("cid")
+            or raw.get("commentId") or raw_tid or ""
+        )
+        try:
+            tid_int = int(str(raw_tid))
+        except (TypeError, ValueError):
+            tid_int = 0
         return Comment(
             uin=int(raw.get("uin") or 0),
             nickname=raw.get("name") or "",
             content=raw.get("content") or "",
             create_time=int(raw.get("create_time") or 0),
             create_time_str=raw.get("createTime2") or "",
-            tid=int(raw.get("tid") or 0),
+            tid=tid_int,
+            comment_id=comment_id.strip(),
             parent_tid=parent_tid,
             source_name=raw.get("source_name") or "",
             source_url=raw.get("source_url") or "",
@@ -247,6 +259,14 @@ class Post(pydantic.BaseModel):
     """转发内容"""
     comments: List[Comment] = pydantic.Field(default_factory=list)
     """评论列表"""
+    like_count: int = 0
+    """点赞总数（get_like_list_app 的 total_number）"""
+    like_users: List[str] = pydantic.Field(default_factory=list)
+    """点赞人昵称列表（最近点赞的，最多 query_count 个）"""
+    like_key: str = ""
+    """说说的点赞 key（curlikekey/orglikekey，取列表接口必需；空则回退手拼 unikey）"""
+    is_liked: bool = False
+    """当前登录者是否已赞（详情接口 isliked，用于补偿 get_like_list 不含自己的情况）"""
     extra_text: Optional[str] = None
     """额外文本"""
 
