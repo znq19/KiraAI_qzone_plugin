@@ -72,36 +72,53 @@ v1.4.3：
 
 2026.08.09
 v1.4.4：
-- **Cookie 刷新加固**：
+- Cookie 刷新加固：
   - `get_cookies` 请求显式 5 秒超时（原为 OneBot 默认 10 秒），OneBot 繁忙时不再拖死发布/评论链路。
   - 刷新失败也推进节流时间戳（原仅成功才更新，失败会反复触发刷新生风暴），失败冷却由 300 秒缩短为 10 秒，下个用即刷/周期任务自动再试，OneBot 恢复即续回。
-  - **启动/重载自愈增强**：插件启动或热重载瞬间 OneBot 适配器常尚未就绪（`login_success_event` 未触发导致 get_cookies 快速失败），此时不再直接判死——自动安排后台延迟重试（15s/30s/60s/120s 递增，最多 4 次），OneBot 恢复后几十秒内自动续回，无需手动重载或等待下一次操作触发；自愈窗口内工具调用会明确提示「Cookie 正在后台自动获取中，请稍后再试」。
-- **历史图片自动续命**：定时发布引用历史图片 URL 时，先调用 `get_msg` 刷新已过期的 CDN 链接（rkey 约 1 小时有效，过期下载必 HTTP 400）再下载，续命成功即可正常发布；`download_file` 对 HTTP 400 直接快速失败不再重试白等。
-- **定时发布失败降级**：图片按目标尽力补足后仍全部获取失败时，自动降级为纯文字发布（不再整体失败导致 AI 反复重试空转）。
-- **评论防重复与确认简化**：
+  - 启动/重载自愈增强：插件启动或热重载瞬间 OneBot 适配器常尚未就绪（`login_success_event` 未触发导致 get_cookies 快速失败），此时不再直接判死——自动安排后台延迟重试（15s/30s/60s/120s 递增，最多 4 次），OneBot 恢复后几十秒内自动续回，无需手动重载或等待下一次操作触发；自愈窗口内工具调用会明确提示「Cookie 正在后台自动获取中，请稍后再试」。
+- 历史图片自动续命：定时发布引用历史图片 URL 时，先调用 `get_msg` 刷新已过期的 CDN 链接（rkey 约 1 小时有效，过期下载必 HTTP 400）再下载，续命成功即可正常发布；`download_file` 对 HTTP 400 直接快速失败不再重试白等。
+- 定时发布失败降级：图片按目标尽力补足后仍全部获取失败时，自动降级为纯文字发布（不再整体失败导致 AI 反复重试空转）。
+- 评论防重复与确认简化：
   - 评论接口返回成功即成功，不再依赖详情回读确认（回读受 commentlist 截断/缓存延迟影响会误判，进而触发 AI 重试造成重复评论或加剧风控）。
   - 提交前自动幂等检查（本地比对，零 token）：已评论过相同内容则不重复提交、不重复自动点赞。
   - `api.comment` user/H5 路径成功判定兼容 `ret=0` 返回格式，避免 user 路径实际成功却被误判后走 H5 双发重复评论。
-- **评论/回复任务文案精简**：评论任务与回复任务统一要求「自然一点和简洁（0-15字内）」，后台直接生成模式与工具内自动生成的评论/回复 prompt 同步统一为 0-15 字。
-- **新增删除评论工具 `qzone_delete_comment`**：支持删除主评论与楼中回复（子回复），支持删除自己空间说说下的任意评论，或删除自己发布在别人说说下的评论/回复；采用 sns → taotao → mobile 三级降级（参考 onebot-qzone 实现）。
-- **评论 ID 体系修正（关键）**：
+- 评论/回复任务文案精简：评论任务与回复任务统一要求「自然一点和简洁（0-15字内）」，后台直接生成模式与工具内自动生成的评论/回复 prompt 同步统一为 0-15 字。
+- 新增删除评论工具 `qzone_delete_comment`：支持删除主评论与楼中回复（子回复），支持删除自己空间说说下的任意评论，或删除自己发布在别人说说下的评论/回复；采用 sns → taotao → mobile 三级降级（参考 onebot-qzone 实现）。
+- 评论 ID 体系修正（关键）：
   - `qzone_view` 评论改用详情接口（PC getdetailv6 → mobile detail → h5 msgdetail_v6 三级降级）拉完整评论，修复 msglist 的 commentlist 截断导致"评论看不全"的问题。
-  - 评论展示与删除统一使用**真实评论 ID**（长数字或含 `_r_` 的合成 id）：msglist/feeds3 里的评论 `data-tid` 常是帖内短楼层号（1、2、3），删除接口需要真实 commentid，用短号删除会返回 `-3 参数错误`。删除前插件会先拉详情反查真实 ID，view 展示的 ID 也改为真实 ID。
+  - 评论展示与删除统一使用真实评论 ID（长数字或含 `_r_` 的合成 id）：msglist/feeds3 里的评论 `data-tid` 常是帖内短楼层号（1、2、3），删除接口需要真实 commentid，用短号删除会返回 `-3 参数错误`。删除前插件会先拉详情反查真实 ID，view 展示的 ID 也改为真实 ID。
   - `delete_comment` 成功判定兼容嵌套 `data.code/data.ret`；taotao 路径支持 `comment_id` 与 `commentId+topicId` 两种参数变体。
-- **删除评论实测打通 + 成功判定修复（v1.4.4 追加）**：
-  - **关键洞察**：部分环境（NapCat/LLOneBot）`user.qzone.qq.com` 代理域全线不可用（详情/评论列表接口返回空或 -3），但 **`h5.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/` 域可用**（评论回复接口 emotion_cgi_re_feeds 即用此域）。删除评论改为 **h5 域 `emotion_cgi_delcomment_ugc` 优先**，参数用实测版：`topicId=作者QQ_说说key` + `commentId=短楼层号` + `format=fs` + `code_version=1`——**短楼层号（1、2）直接可删**，不再强求真实长 ID。
-  - **修复 `or -1` falsy 陷阱**：`delete_comment` 的成功判定原先写 `int(code or -1) == 0`，当接口返回 `code=0`（成功）时 `0 or -1` 求值为 -1 → 实际删除成功却被判失败，继续空跑降级链并误报"删除失败"。改为显式 None 判断后，`code=0/ret=0` 正确识别为成功（本地单测验证修复前后行为差异）。
+- 删除评论实测打通 + 成功判定修复（v1.4.4 追加）：
+  - 关键洞察：部分环境（NapCat/LLOneBot）`user.qzone.qq.com` 代理域全线不可用（详情/评论列表接口返回空或 -3），但 `h5.qzone.qq.com/proxy/domain/taotao.qzone.qq.com/` 域可用（评论回复接口 emotion_cgi_re_feeds 即用此域）。删除评论改为 h5 域 `emotion_cgi_delcomment_ugc` 优先，参数用实测版：`topicId=作者QQ_说说key` + `commentId=短楼层号` + `format=fs` + `code_version=1`——短楼层号（1、2）直接可删，不再强求真实长 ID。
+  - 修复 `or -1` falsy 陷阱：`delete_comment` 的成功判定原先写 `int(code or -1) == 0`，当接口返回 `code=0`（成功）时 `0 or -1` 求值为 -1 → 实际删除成功却被判失败，继续空跑降级链并误报"删除失败"。改为显式 None 判断后，`code=0/ret=0` 正确识别为成功（本地单测验证修复前后行为差异）。
   - `qzone_view` 移除 PC/mobile 评论列表接口前置（该环境必失败，避免先报错再回退），直接走 h5 详情，秒回且评论完整；删除反查同步简化。
-  - **降级链清理**：删除评论仅保留 h5 域 `emotion_cgi_delcomment_ugc`（实测成功路径，v1 实测参数优先 + v0 同域参数兜底）；`user.qzone.qq.com` 域 / sns / mobile 三条在 NapCat 环境必失败的路径已**直接移除**（不再每次陪着跑一遍）。`get_comments` 死代码及废弃 URL 常量同步删除。
-- **点赞/取消点赞合一（`qzone_like` 兼任两职）**：`qzone_like` 新增可选参数 `action`（默认 `like` 点赞，传 `unlike` 取消点赞），取消点赞三级降级（参考 onebot-qzone unlikeEmotion 实测实现）——`internal_dolike_app`（同点赞 URL，不带 abstime）→ `like_cgi_likev6` + `optype=1`（0 赞 / 1 取消）→ `mobile/like` + `active=1`（0 赞 / 1 取消）。调用前自动做已赞检测：取消时没赞过提示无需取消，点赞时已赞过提示无需重复。原独立的 `qzone_unlike` 工具已移除，避免 AI 面对两个工具选错。
-- **取消点赞不依赖已赞检测**：h5 详情的 `isliked` 存在滞后（刚点赞成功详情仍显示未赞），若拿它拦截取消会导致取消被误挡；已改为取消直接执行（幂等无害），已赞检测仅作日志参考。
-- **view 显示点赞信息**：新增 `api.get_like_list`（独立接口 `get_like_list_app`，unikey 带 `.1` 后缀，返回点赞人昵称 + 总数）；`qzone_view` 每条说说展示 QQ 空间原生表达——1 人「周武觉得很赞」、不超过上限列全名「周武、C7 觉得很赞」、超过则「周武、C7 等 12 人觉得很赞」；说说列表/详情接口若内联 `likeinfo` 则直接解析（Post 新增 `like_count` / `like_users` 字段）。展示昵称数量上限可通过配置 `like_users_display_max` 调整（默认 5，范围 ≥1）。
-- **点赞列表 key 修正（关键）**：`get_like_list_app` 的 unikey 应优先使用说说数据返回的真实 key（`curlikekey`/`orglikekey`，Post 新增 `like_key` 字段，parser 解析），手拼 `mood/{tid}.1` 仅作回退——手拼 key 在 appid 非 311 的说说不适用，会导致点赞列表不全（如自己点的赞不显示）。get_like_list 日志现在输出 `total/shown/uins/key 来源`，便于定位列表完整性。
-- **点赞列表自己补偿 + 展示格式调整（实测定稿）**：实测确认 `get_like_list_app` 的 like_uin_info **不含当前登录者自己**（空间显示 2 人已赞，接口只返回 1 人）。修复：**本地点赞状态跟踪**（点赞/取消成功即记录到 `_liked_posts` 并持久化到 state.json，不依赖不可靠的接口 isliked）；view 里若自己已赞但列表缺自己（按 uin 比对），自动补自己的**真实昵称**（防「我」昵称诈骗，获取失败才回退「我」）并修正总数。展示格式：`已赞2人：周武、C7 觉得很赞`；超过昵称上限 `已赞12人：周武、C7 等人 觉得很赞`（前缀带总数，"等人"不重复数字）。
-- **取消点赞真实生效（移除假成功路径）**：实测发现原 unlike 三级降级的方法1（`internal_dolike_app`，参数与点赞相同 active=0）对已赞说说重复调用也会返回 ret=0（**假成功**，实际不取消），导致"取消成功"但空间赞还在。修复：unlike 改为 **`like_cgi_likev6 + optype=1`（真正取消）主路径 → mobile active=1 兜底**，移除 dolike 假成功路径；点赞/取消均加 route 日志（`QZone点赞成功: route=dolike/likev6/mobile_like`、`QZone取消点赞成功: route=unlikev6/mobile_unlike`）便于定位。
-- **点赞/取消统一 dolike 唯一路径（实测定稿）**：实测本环境 `like_cgi_likev6` / `mobile like` 均「响应内容为空」不可用（连续多次），而点赞走 `internal_dolike_app` 正常生效 → 点赞与取消**统一走 dolike**：点赞 `active=0`，取消 `active=1`（与 mobile 相同 0 赞 / 1 取消语义）。likev6/mobile 死兜底与废弃 URL 常量（LIKE_V6_URL/MOBILE_LIKE_URL）已砍掉，不再出现空响应白等。
-- **点赞/取消参数修正为网页端实测格式（网络核验，关键）**：精易论坛实测确认旧参数格式（`from=1`、unikey 无 `.1` 后缀、带 appid/typeid/fid）在现代 QQ 空间**返回 ret=0 但实际不生效（假成功）**；网页端真实抓包格式为：**unikey/curkey 带 `.1` 后缀**（`http://user.qzone.qq.com/{作者}/mood/{tid}.1`）+ **`from=-100`** + **`face=0`** + opuin/fupdate/qzreferrer。**取消赞的正确接口是 `internal_unlike_app`**（把 internal_dolike_app 的 DOlike 改成 unlike，同参数）。点赞/取消均已按此重写；view 已赞状态日志 `view 已赞状态: ... msglist_is_liked=... detail_is_liked=...` 用于确认"自己是否已赞"的真实字段可用性。
-- **自己昵称改 OneBot 主协议获取**：cgi_personal_card 在部分环境不可用导致昵称取不到（view 回退显示「我」）。改为优先 **OneBot `get_stranger_info`**（QQ 主协议，NapCat/LLOneBot 必支持）拿自己昵称，cgi_personal_card 仅作回退；view 展示自己的赞时显示「**General New（我）**」——真实昵称防昵称诈骗，同时「（我）」标记明确是 bot 自己（昵称获取失败才回退「我」）。
+  - 降级链清理：删除评论仅保留 h5 域 `emotion_cgi_delcomment_ugc`（实测成功路径，v1 实测参数优先 + v0 同域参数兜底）；`user.qzone.qq.com` 域 / sns / mobile 三条在 NapCat 环境必失败的路径已直接移除（不再每次陪着跑一遍）。`get_comments` 死代码及废弃 URL 常量同步删除。
+- 点赞/取消点赞合一（`qzone_like` 兼任两职）：`qzone_like` 新增可选参数 `action`（默认 `like` 点赞，传 `unlike` 取消点赞），取消点赞三级降级（参考 onebot-qzone unlikeEmotion 实测实现）——`internal_dolike_app`（同点赞 URL，不带 abstime）→ `like_cgi_likev6` + `optype=1`（0 赞 / 1 取消）→ `mobile/like` + `active=1`（0 赞 / 1 取消）。调用前自动做已赞检测：取消时没赞过提示无需取消，点赞时已赞过提示无需重复。原独立的 `qzone_unlike` 工具已移除，避免 AI 面对两个工具选错。
+- 取消点赞不依赖已赞检测：h5 详情的 `isliked` 存在滞后（刚点赞成功详情仍显示未赞），若拿它拦截取消会导致取消被误挡；已改为取消直接执行（幂等无害），已赞检测仅作日志参考。
+- view 显示点赞信息：新增 `api.get_like_list`（独立接口 `get_like_list_app`，unikey 带 `.1` 后缀，返回点赞人昵称 + 总数）；`qzone_view` 每条说说展示 QQ 空间原生表达——1 人「周武觉得很赞」、不超过上限列全名「周武、C7 觉得很赞」、超过则「周武、C7 等 12 人觉得很赞」；说说列表/详情接口若内联 `likeinfo` 则直接解析（Post 新增 `like_count` / `like_users` 字段）。展示昵称数量上限可通过配置 `like_users_display_max` 调整（默认 5，范围 ≥1）。
+- 点赞列表 key 修正（关键）：`get_like_list_app` 的 unikey 应优先使用说说数据返回的真实 key（`curlikekey`/`orglikekey`，Post 新增 `like_key` 字段，parser 解析），手拼 `mood/{tid}.1` 仅作回退——手拼 key 在 appid 非 311 的说说不适用，会导致点赞列表不全（如自己点的赞不显示）。get_like_list 日志现在输出 `total/shown/uins/key 来源`，便于定位列表完整性。
+- 点赞列表自己补偿 + 展示格式调整（实测定稿）：实测确认 `get_like_list_app` 的 like_uin_info 不含当前登录者自己（空间显示 2 人已赞，接口只返回 1 人）。修复：本地点赞状态跟踪（点赞/取消成功即记录到 `_liked_posts` 并持久化到 state.json，不依赖不可靠的接口 isliked）；view 里若自己已赞但列表缺自己（按 uin 比对），自动补自己的真实昵称（防「我」昵称诈骗，获取失败才回退「我」）并修正总数。展示格式：`已赞2人：周武、C7 觉得很赞`；超过昵称上限 `已赞12人：周武、C7 等人 觉得很赞`（前缀带总数，"等人"不重复数字）。
+- 取消点赞真实生效（移除假成功路径）：实测发现原 unlike 三级降级的方法1（`internal_dolike_app`，参数与点赞相同 active=0）对已赞说说重复调用也会返回 ret=0（假成功，实际不取消），导致"取消成功"但空间赞还在。修复：unlike 改为 `like_cgi_likev6 + optype=1`（真正取消）主路径 → mobile active=1 兜底，移除 dolike 假成功路径；点赞/取消均加 route 日志（`QZone点赞成功: route=dolike/likev6/mobile_like`、`QZone取消点赞成功: route=unlikev6/mobile_unlike`）便于定位。
+- 点赞/取消统一 dolike 唯一路径（实测定稿）：实测本环境 `like_cgi_likev6` / `mobile like` 均「响应内容为空」不可用（连续多次），而点赞走 `internal_dolike_app` 正常生效 → 点赞与取消统一走 dolike：点赞 `active=0`，取消 `active=1`（与 mobile 相同 0 赞 / 1 取消语义）。likev6/mobile 死兜底与废弃 URL 常量（LIKE_V6_URL/MOBILE_LIKE_URL）已砍掉，不再出现空响应白等。
+- 点赞/取消参数修正为网页端实测格式（网络核验，关键）：精易论坛实测确认旧参数格式（`from=1`、unikey 无 `.1` 后缀、带 appid/typeid/fid）在现代 QQ 空间返回 ret=0 但实际不生效（假成功）；网页端真实抓包格式为：unikey/curkey 带 `.1` 后缀（`http://user.qzone.qq.com/{作者}/mood/{tid}.1`）+ `from=-100` + `face=0` + opuin/fupdate/qzreferrer。取消赞的正确接口是 `internal_unlike_app`（把 internal_dolike_app 的 DOlike 改成 unlike，同参数）。点赞/取消均已按此重写；view 已赞状态日志 `view 已赞状态: ... msglist_is_liked=... detail_is_liked=...` 用于确认"自己是否已赞"的真实字段可用性。
+- 自己昵称改 OneBot 主协议获取：cgi_personal_card 在部分环境不可用导致昵称取不到（view 回退显示「我」）。改为优先 OneBot `get_stranger_info`（QQ 主协议，NapCat/LLOneBot 必支持）拿自己昵称，cgi_personal_card 仅作回退；view 展示自己的赞时显示「General New（我）」——真实昵称防昵称诈骗，同时「（我）」标记明确是 bot 自己（昵称获取失败才回退「我」）。
+
+2026.08.10
+v1.4.5：
+- 操作节奏人性化（透明节流）：
+  - 新增写操作透明节流：评论/点赞/回复/删评论发送前按配置范围随机错峰（默认 0.5-1.5s，配置 action_interval），仅延迟发送时机，绝不拦截/跳过/失败，AI 无感知；锁只包 sleep 不包 HTTP，不同会话互不卡死。
+  - 评论后自动点赞前增加随机延迟（默认 0.5-1.5s，配置 like_delay），错开「评论+点赞」的连续请求特征。
+  - 后台直接生成模式：自动评论/自动回复的循环间隔由固定 2s 改为随机 0.5-1.5s；自动评论点赞前同样随机延迟。
+  - 以上范围均可在 WebUI 调整，连续操作被风控时可调大（如 2-4s）。
+- 新增 QQ 号黑白名单（qzone_blacklist / qzone_whitelist，逗号分隔，默认空）：
+  - 黑名单命中者插件全功能禁止（含查看/识图），工具返回明确拒绝提示，不发 HTTP 请求；黑名单优先于白名单，填了自己也禁止自己。
+  - 白名单非空时只允许名单内 + 自己；留空则除黑名单外全部允许。
+  - 校验覆盖所有带 target_id 的工具（评论/点赞/回复/删评论/查看/识图）及后台自动评论选帖过滤。
+- 评论回读确认开关（comment_verify，默认关，诊断模式）：
+  - 开启后评论提交成功会延迟 1.5-2.5s 再拉一次说说详情确认评论是否落库，结果只写日志不阻断成功判定；
+  - 用于排查「接口说成功但评论没显示」（假成功/风控吞评论）问题，避免重蹈旧版回读误判导致重复评论的覆辙。
+- 评论假成功可观测：评论提交成功时新增日志记录接口原始 code/ret/msg，便于对照「接口成功但评论未落库」。
+- 已知说明：评论「发了看不到/过段时间消失」多为 QQ 空间风控（操作过快、工具发表、重复内容，官方限制约 24h 恢复），本版本通过错峰节流降低触发概率；若仍出现可用 comment_verify 加日志排查。
 
 
 

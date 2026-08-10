@@ -1,4 +1,4 @@
-# QQ空间助手插件安装使用教程（小白版） v1.4.4
+# QQ空间助手插件安装使用教程（小白版） v1.4.5
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_qzone_plugin)
 
@@ -84,7 +84,7 @@ pip install apscheduler beautifulsoup4 json5 aiohttp
 
 插件的大部分配置项都可以在 WebUI 中直接修改。访问 `http://127.0.0.1:5267`，进入插件管理页面，找到“QQ空间助手”，点击“配置”。
 
-以下是各配置项的含义（基于 v1.4.4）：
+以下是各配置项的含义（基于 v1.4.5）：
 
 <details>
 <summary>📋 点击展开查看全部配置项</summary>
@@ -120,6 +120,11 @@ pip install apscheduler beautifulsoup4 json5 aiohttp
 | `max_comments_per_cycle` | int | 否 | 每次自动评论最多评论多少条说说（后台模式有效，指令模式下由AI自主决定）。 |
 | `max_replies_per_cycle` | int | 否 | 每次自动回复最多处理多少条新评论（后台模式有效）。 |
 | `like_when_comment` | boolean | 否 | 评论说说后自动顺带点赞（插件直接执行，AI 无需再调点赞工具），默认false。群聊指令模式和后台直接生成模式均生效。 |
+| `action_interval` | string | 否 | 写操作（评论/点赞/回复/删评论）发送前的透明节流范围，默认 `0.5-1.5s`。仅错开发送时机，不拦截不失败，AI 无感知；连续操作被风控时可调大（如 `2-4s`）。 |
+| `like_delay` | string | 否 | 评论后自动点赞前的随机延迟范围，默认 `0.5-1.5s`。错开「评论+点赞」的连续请求特征。 |
+| `comment_verify` | switch | 否 | 评论提交后回读确认（诊断模式），默认关闭。开启后提交成功会延迟再拉一次详情确认评论是否落库，结果只写日志不阻断判定，排查「评论成功但没显示」时临时开启。 |
+| `qzone_blacklist` | string | 否 | 空间操作黑名单（QQ号，逗号分隔），默认空。禁止对填写的空间进行任何操作（包括查看）；黑名单优先于白名单，填了自己也禁止自己。 |
+| `qzone_whitelist` | string | 否 | 空间操作白名单（QQ号，逗号分隔），默认空。只允许对填写的空间进行操作（自己始终允许，除非进黑名单）；留空则除黑名单外全部允许。 |
 | `like_users_display_max` | int | 否 | 查看说说时展示点赞人昵称的数量上限，默认 5。展示格式「已赞2人：周武、C7 觉得很赞」，超过上限「已赞12人：周武、C7 等人 觉得很赞」（总数不受影响，只影响展示几个昵称）。 |
 | `visitor_limit` | int | 否 | 访客统计最多返回的最近访客明细条数，默认 20，可设置 1-50；今日和最近30天统计数字不受影响。 |
 | `image_manifest_enabled` | switch | 否 | 是否向 AI 注入「近期图片清单」（含每张图的内容描述），默认开启。开启后她发说说配图时知道图片实际内容，可按序号选图。 |

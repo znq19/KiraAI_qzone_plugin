@@ -102,6 +102,23 @@ class QzonePlugin(BasePlugin):
         self.auto_reply_schedule = cfg.get("auto_reply_schedule", "")
         self.auto_reply_enabled = cfg.get("auto_reply_enabled", False)
         self.like_when_comment = cfg.get("like_when_comment", False)
+
+        # 写操作透明节流与自动点赞延迟（"0.5-1.5s" 格式，解析为 (min, jitter)）
+        self.action_interval_min, self.action_interval_jitter = self._parse_delay_range(
+            cfg.get("action_interval", "0.5-1.5s")
+        )
+        self.like_delay_min, self.like_delay_jitter = self._parse_delay_range(
+            cfg.get("like_delay", "0.5-1.5s")
+        )
+        # 评论后回读确认开关（诊断模式，默认关）：只写日志提示，不阻断成功判定
+        self.comment_verify = bool(cfg.get("comment_verify", False))
+        # QQ 号黑白名单（全插件功能生效，默认空 = 不限制）
+        self.qzone_blacklist = [
+            x.strip() for x in str(cfg.get("qzone_blacklist", "") or "").split(",") if x.strip()
+        ]
+        self.qzone_whitelist = [
+            x.strip() for x in str(cfg.get("qzone_whitelist", "") or "").split(",") if x.strip()
+        ]
         # view 展示点赞人昵称的数量上限（默认 5，模拟空间页「xx等人觉得很赞」）
         try:
             self.like_users_display_max = max(1, int(cfg.get("like_users_display_max", 5) or 5))
@@ -146,6 +163,9 @@ class QzonePlugin(BasePlugin):
         self._cookie_refresh_lock = asyncio.Lock()
         self._last_cookie_refresh = 0.0
         self._cookie_refresh_task: Optional[asyncio.Task] = None
+        # 写操作透明节流状态（只包 sleep，不包 HTTP）
+        self._write_lock = asyncio.Lock()
+        self._last_write_ts = 0.0
         # 启动/重载时 get_cookies 失败的延迟自动重试任务（避免重载瞬间 OneBot 未就绪导致插件判死）
         self._startup_retry_task: Optional[asyncio.Task] = None
 
@@ -470,6 +490,57 @@ class QzonePlugin(BasePlugin):
         multipliers = {"d": 86400, "h": 3600, "m": 60, "s": 1}
         val *= multipliers[unit]
         return int(val) if val > 0 else None
+
+    @staticmethod
+    def _parse_delay_range(s, default: str = "0.5-1.5s") -> tuple[float, float]:
+        """解析 '0.5-1.5s' / '1-2' 为 (min, jitter)；解析失败回退默认值。"""
+        def _split(text: str):
+            text = str(text or "").strip().lower()
+            if text.endswith("s"):
+                text = text[:-1]
+            if "-" in text:
+                lo, hi = text.split("-", 1)
+                return float(lo), float(hi)
+            return None
+        for cand in (s, default):
+            try:
+                r = _split(cand)
+                if r is not None and r[0] >= 0 and r[1] >= r[0]:
+                    return r[0], r[1] - r[0]
+            except (TypeError, ValueError):
+                continue
+        return 0.5, 1.0
+
+    async def _throttle_write(self):
+        """写操作透明节流：仅延迟发送时机，绝不拒绝/跳过/失败，AI 无感知。
+
+        锁只包 sleep 段（毫秒级），不包 HTTP 请求，不同会话的写操作互不卡死；
+        框架工具调用本身串行，锁不会死锁。相邻写操作实际间隔 = 最小间隔 + 随机抖动。
+        """
+        async with self._write_lock:
+            now = time.monotonic()
+            wait = self.action_interval_min - (now - self._last_write_ts)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            await asyncio.sleep(random.uniform(0, self.action_interval_jitter))
+            self._last_write_ts = time.monotonic()
+
+    def _target_block_reason(self, target_id) -> Optional[str]:
+        """校验目标 QQ 是否被黑白名单限制（全插件功能生效）。
+
+        返回 None=放行；返回 str=拒绝原因。黑名单最优先（含自己）；
+        白名单非空时仅放行名单内 + 自己（除非自己进黑名单）。
+        """
+        target = str(target_id or "").strip()
+        if not target:
+            return None
+        if target in self.qzone_blacklist:
+            return "该 QQ 已被加入插件黑名单，禁止操作"
+        if self.qzone_whitelist and target not in self.qzone_whitelist:
+            if self.my_uin and target == str(self.my_uin):
+                return None
+            return "该 QQ 不在插件白名单内，禁止操作"
+        return None
 
     def _ensure_ada(self):
         """获取 QQ 适配器实例（兼容新版 KiraAI）"""
@@ -975,6 +1046,8 @@ class QzonePlugin(BasePlugin):
                 return
             # 不评论自己的说说
             posts = [p for p in posts if not self.my_uin or p.uin != self.my_uin]
+            # 黑白名单过滤：黑名单作者跳过；白名单非空时只评论白名单内作者
+            posts = [p for p in posts if not self._target_block_reason(str(p.uin))]
             if not posts:
                 return
             selected = random.sample(posts, min(self.max_comments_per_cycle, len(posts)))
@@ -995,12 +1068,19 @@ class QzonePlugin(BasePlugin):
                     logger.warning(f"自动评论失败: {post.tid} -> {e}")
                     continue
                 if self.like_when_comment and "未重复提交" not in result:
+                    # 透明延迟：随机 0.5~1.5s 后再点赞，错开连续请求特征
+                    await asyncio.sleep(
+                        random.uniform(self.like_delay_min, self.like_delay_min + self.like_delay_jitter)
+                    )
                     like_resp = await self.api.like(post, abstime=post.create_time)
                     if like_resp.ok:
                         logger.info(f"自动点赞成功: {post.tid}")
                     else:
                         logger.warning(f"自动点赞失败: {post.tid} -> {like_resp.message}")
-                await asyncio.sleep(2)
+                # 评论间随机间隔 0.5~1.5s（原固定 2s，改为随机更自然）
+                await asyncio.sleep(
+                    random.uniform(self.action_interval_min, self.action_interval_min + self.action_interval_jitter)
+                )
         except Exception as e:
             logger.error(f"自动评论任务失败: {e}")
 
@@ -1056,6 +1136,10 @@ class QzonePlugin(BasePlugin):
                     self.replied_comments.add(reply_key)
                     self._save_state()
                     new_replies += 1
+                    # 回复间随机间隔 0.5~1.5s，避免连续回复特征
+                    await asyncio.sleep(
+                        random.uniform(self.action_interval_min, self.action_interval_min + self.action_interval_jitter)
+                    )
                     if new_replies >= self.max_replies_per_cycle:
                         break
                 if new_replies >= self.max_replies_per_cycle:
@@ -1620,6 +1704,26 @@ class QzonePlugin(BasePlugin):
         if not resp.ok:
             raise RuntimeError(f"评论接口失败: {resp.message}")
         logger.info(f"QZone评论提交成功: post={post.tid} content={content[:40]}")
+        # 假成功可观测：记录接口原始 code/ret，便于排查"接口说成功但评论没落库"
+        raw = resp.raw or {}
+        logger.info(
+            f"评论接口原始响应: post={post.tid} code={resp.code} ret={raw.get('ret')} "
+            f"msg={raw.get('msg') or raw.get('message') or resp.message}"
+        )
+        # 回读确认（诊断模式，默认关）：只写日志/附注，不阻断成功判定，
+        # 避免重蹈 v1.4.4 之前"回读误判失败 -> AI 重试 -> 重复评论"的覆辙。
+        if self.comment_verify:
+            try:
+                await asyncio.sleep(random.uniform(1.5, 2.5))  # 等评论落库
+                verify_post = await self._get_detail_post(post)
+                if self._count_own_comment(verify_post, content) > 0:
+                    logger.info(f"评论回读确认成功: post={post.tid}")
+                else:
+                    logger.warning(
+                        f"评论回读未确认（可能延迟或风控）: post={post.tid} content={content[:40]}"
+                    )
+            except Exception as e:
+                logger.debug(f"评论回读确认失败: {e}")
         return "评论成功"
 
     async def _delete(self, tid: str) -> str:
@@ -1905,6 +2009,10 @@ class QzonePlugin(BasePlugin):
     )
     async def tool_view(self, event: KiraMessageBatchEvent, target_id: str = None, num: int = 1):
         # 查看是只读操作，所有用户可用，不做权限检查
+        if target_id is not None:
+            block = self._target_block_reason(target_id)
+            if block:
+                return f"查看被拒绝：{block}"
         await self._ensure_api()
         try:
             if target_id is None:
@@ -2052,6 +2160,9 @@ class QzonePlugin(BasePlugin):
     async def tool_describe_image(self, event: KiraMessageBatchEvent, target_id: str, tid: str, index: int = 1):
         if not self.qzone_image_desc_enabled:
             return "空间图片识别功能未启用。"
+        block = self._target_block_reason(target_id)
+        if block:
+            return f"识图被拒绝：{block}"
         # 识图是只读操作，所有用户可用，不做权限检查
         await self._ensure_api()
         # 自己的空间默认不识图：配图本来就是 bot 自己选的（可用配置开启）
@@ -2121,7 +2232,11 @@ class QzonePlugin(BasePlugin):
         # 不检查黑名单，用户主动触发不受限制
         if not await self._check_master(event):
             return "抱歉，只有主人才能使用此功能。"
+        block = self._target_block_reason(target_id)
+        if block:
+            return f"点赞被拒绝：{block}"
         await self._ensure_api()
+        await self._throttle_write()
         try:
             post = QzonePost(uin=int(target_id), tid=tid)
             # 先取详情：获得说说发布时间（点赞/取消赞参数需要）并做已赞检测（避免无意义请求）
@@ -2172,7 +2287,11 @@ class QzonePlugin(BasePlugin):
         # 不检查黑名单，用户主动触发不受限制
         if not await self._check_master(event):
             return "抱歉，只有主人才能使用此功能。"
+        block = self._target_block_reason(target_id)
+        if block:
+            return f"评论被拒绝：{block}"
         await self._ensure_api()
+        await self._throttle_write()
         try:
             full_post = None
             if not content:
@@ -2196,6 +2315,10 @@ class QzonePlugin(BasePlugin):
             # 评论后自动点赞（插件直接执行，无需 AI 再调一次工具）。
             # 幂等命中（已存在相同评论）时不重复点赞。
             if self.like_when_comment and "未重复提交" not in result:
+                # 透明延迟：随机 0.5~1.5s 后再点赞，错开"评论+点赞"的连续请求特征
+                await asyncio.sleep(
+                    random.uniform(self.like_delay_min, self.like_delay_min + self.like_delay_jitter)
+                )
                 try:
                     like_post = full_post or post
                     if full_post is None:
@@ -2262,6 +2385,9 @@ class QzonePlugin(BasePlugin):
         # 不检查黑名单，用户主动触发不受限制
         if not await self._check_master(event):
             return "抱歉，只有主人才能使用此功能。"
+        block = self._target_block_reason(target_id)
+        if block:
+            return f"删除评论被拒绝：{block}"
         await self._ensure_api()
         try:
             real_cid = str(comment_id)
@@ -2335,7 +2461,11 @@ class QzonePlugin(BasePlugin):
         # 不检查黑名单，用户主动触发不受限制
         if not await self._check_master(event):
             return "抱歉，只有主人才能使用此功能。"
+        block = self._target_block_reason(target_id)
+        if block:
+            return f"回复被拒绝：{block}"
         await self._ensure_api()
+        await self._throttle_write()
         try:
             post = QzonePost(uin=int(target_id), tid=tid)
             detail_resp = await self.api.get_detail(post)
