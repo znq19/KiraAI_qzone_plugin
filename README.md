@@ -1,4 +1,4 @@
-# QQ空间助手插件安装使用教程（小白版） v1.4.5
+# QQ空间助手插件安装使用教程（小白版） v1.4.6
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_qzone_plugin)
 
