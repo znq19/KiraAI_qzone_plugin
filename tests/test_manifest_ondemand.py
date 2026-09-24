@@ -237,6 +237,28 @@ class TestWantImages(B.LoopTestCase):
         self.assertIn("说说发布成功", out)
         self.assertEqual(self.plugin.api.published, [["https://cdn.qq.com/real.jpg?rkey=1"]])
 
+    def test_want_images_ignored_when_list_already_injected(self):
+        """清单已经进过上下文（例如定时发布任务那一轮）→ 这个参数应被忽略、直接发布。
+
+        这是 v1.4.9 的闸门：不让"多传一个参数"白白推迟一轮。
+        """
+        self.run_(self.plugin._inject_image_manifest(event(publish_task=True), B.LLMRequest(), None))
+        self.assertIn(SID, self.plugin._manifest_fresh_ts, '注入后应留下标记')
+        out = self.run_(self.plugin.tool_publish(event(text="发个说说"), text="今日",
+                                                 want_images=True))
+        self.assertIn("说说发布成功", out, "清单已在上下文里时不该再返回清单")
+        self.assertEqual(self.plugin.api.published, [[]])
+
+    def test_flag_cleared_when_new_turn_has_no_list(self):
+        """新一轮没有注入清单 → 标记清除，want_images 恢复生效。"""
+        self.run_(self.plugin._inject_image_manifest(event(publish_task=True), B.LLMRequest(), None))
+        self.assertIn(SID, self.plugin._manifest_fresh_ts)
+        self.run_(self.plugin._inject_image_manifest(event(text="随便聊聊"), B.LLMRequest(), None))
+        self.assertNotIn(SID, self.plugin._manifest_fresh_ts, '没有清单的轮次应清掉标记')
+        out = self.run_(self.plugin.tool_publish(event(text="发个说说"), text="今日",
+                                                 want_images=True))
+        self.assertIn("说说未发布", out, '没有清单时这个参数应重新生效')
+
     def test_timer_turn_publishes_normally(self):
         """定时任务那一轮已经注入过清单，直接发布即可。"""
         out = self.run_(self.plugin.tool_publish(event(publish_task=True), text="定时发"))

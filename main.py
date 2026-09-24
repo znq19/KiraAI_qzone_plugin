@@ -83,6 +83,9 @@ RECENT_IMAGES_TTL = 20.0
 #   展示就按原样，不擅自改写。
 # 状态落盘节流（合并多次写，异步落盘）
 STATE_FLUSH_DELAY = 2.0
+# 清单"刚注入过"的有效期（秒）。钩子每轮都会维护该标记（注入时置位、未注入时清除），
+# 这里只是安全兜底，避免异常路径下标记残留导致 want_images 被长期忽略。
+MANIFEST_FRESH_TTL = 300.0
 
 # 启动/重载时的凭证重试退避（绝对时刻，不是累加 sleep）
 STARTUP_RETRY_DELAYS = (15, 30, 60, 120)
@@ -239,6 +242,8 @@ class QzonePlugin(BasePlugin):
         self._bg_tasks: set = set()
         # 识图负缓存：key -> 失败时间戳（TTL 内不再重试、不再刷日志）
         self._desc_failed: dict[str, float] = {}
+        # 该会话最近一次"清单被注入到请求里"的时间；用来判断 want_images 是否多余
+        self._manifest_fresh_ts: dict[str, float] = {}
         # 图片缓存键 -> 已就绪描述（只放"已知描述"，供免费路径复用）
         self._entry_desc: dict[str, str] = {}
         # 近期图片短缓存：sid -> (时间戳, [url])
@@ -2146,6 +2151,8 @@ class QzonePlugin(BasePlugin):
             # 注入策略：on_demand（默认）只在"这一轮确实要发说说"时注入，
             # 其它轮次一句都不加 —— 既不白占 token，也不在无关话题里误导模型。
             if not self._should_inject_manifest(event):
+                # 这一轮没有清单：清掉"刚注入过"的标记，让 want_images 恢复生效
+                self._manifest_fresh_ts.pop(sid, None)
                 return
             # 定时发布任务：从候选里剔除去重窗口内已发布过的图，
             # 从源头避免连续几条说说配同一张图（用户可见症状）。
@@ -2169,6 +2176,10 @@ class QzonePlugin(BasePlugin):
             req.user_prompt.insert(0, Prompt(
                 text, name="qzone_images", source="qzone_plugin", persist=False
             ))
+            self._manifest_fresh_ts[sid] = time.time()
+            if len(self._manifest_fresh_ts) > 50:
+                for key in list(self._manifest_fresh_ts)[: len(self._manifest_fresh_ts) - 50]:
+                    self._manifest_fresh_ts.pop(key, None)
         except Exception as e:
             logger.debug(f"注入图片清单失败: {e}")
 
@@ -2730,7 +2741,7 @@ class QzonePlugin(BasePlugin):
     # ---------- 工具注册（不检查黑名单，用户主动触发不受限制） ----------
     @register_tool(
         name="qzone_publish",
-        description="发布一条说说到自己的QQ空间。配图：1) images 传聊天里看到过的图片路径（如 data/temp/xxx.jpg）或URL；2) image_indices 传[近期图片]清单序号。优先使用你真正了解内容的方式配图；手里没有可用路径时可传 want_images=true 先取一份候选清单（本次不会发布），再带 image_indices 调用一次。不传图即纯文字发布。",
+        description="发布一条说说到自己的QQ空间。配图：优先用你已经在聊天里看到过的图片、或[近期图片]清单里列出的图片 —— 前者的路径/URL 传给 images，后者的序号传给 image_indices。都不传即纯文字发布。",
         params={
             "type": "object",
             "properties": {
@@ -2747,7 +2758,7 @@ class QzonePlugin(BasePlugin):
                 },
                 "want_images": {
                     "type": "boolean",
-                    "description": "想配图但手里没有可用路径时传 true：只返回候选清单、不发布，你再带 image_indices 调用一次。已有图片路径时不必传。",
+                    "description": "只有在「想配图、但既没有图片路径、也没有[近期图片]清单」时才传 true：我会返回一份候选清单（本次不会发布），你再带 image_indices 调用一次。手里已有路径或清单时不要传（会白白多一次调用）。",
                     "default": False
                 }
             },
@@ -2809,12 +2820,18 @@ class QzonePlugin(BasePlugin):
             # 显式请求清单：本次不发布，先把当前可用候选给她，再由她带 image_indices 调一次。
             # 清单为空时直接继续发布（不让她白跑一趟）。
             if want_images and not image_indices and not valid_sources:
-                entries = self._manifest_entries(
-                    event.sid, apply_dedupe=task_policy is not None
-                )
-                if entries:
-                    return self._manifest_reply(entries)
-                logger.info("want_images=true 但当前没有可用候选，按纯文字继续发布")
+                sid = getattr(event, "sid", "") or ""
+                if time.time() - self._manifest_fresh_ts.get(sid, 0.0) < MANIFEST_FRESH_TTL:
+                    # 清单已经在她的上下文里（例如定时发布任务那一轮）→ 这个参数是多余的，
+                    # 直接忽略它照常发布，不让"多传一个参数"白白推迟一轮。
+                    logger.info("本轮已注入[近期图片]清单，忽略 want_images 参数，直接按原流程发布")
+                else:
+                    entries = self._manifest_entries(
+                        sid, apply_dedupe=task_policy is not None
+                    )
+                    if entries:
+                        return self._manifest_reply(entries)
+                    logger.info("want_images=true 但当前没有可用候选，按纯文字继续发布")
             if task_target is not None:
                 if task_target > 0:
                     valid_sources = await self._fill_scheduled_publish_sources(
