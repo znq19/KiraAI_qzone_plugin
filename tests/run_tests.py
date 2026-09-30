@@ -30,6 +30,7 @@ MODULES = [
     'test_publish_paths',
     'test_lifecycle',
     'test_review_fixes',
+    'test_silent_guard',
 ]
 
 

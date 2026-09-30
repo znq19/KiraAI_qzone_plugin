@@ -1,4 +1,4 @@
-# QQ空间助手插件安装使用教程（小白版） v1.4.9
+# QQ空间助手插件安装使用教程（小白版） v1.4.10
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/znq19/KiraAI_qzone_plugin)
 
@@ -119,7 +119,7 @@ pip install apscheduler beautifulsoup4 json5 aiohttp
 | `auto_reply_enabled` | boolean | 否 | 是否开启自动回复评论（需配置 `auto_reply_schedule`）。 |
 | `task_group_ids` | string | 否 | **群聊指令模式**：接收定时任务指令的群号列表（多个用英文逗号分隔）。每次定时任务会随机选择一个群发送指令。 |
 | `task_private_ids` | string | 否 | **群聊指令模式**：接收定时任务指令的个人QQ号列表（多个用英文逗号分隔）。 |
-| `task_message_style` | enum | 否 | 通用任务消息样式：`silent`=AI 静默执行任务，群里完全看不到她的回复（真无痕，推荐）；`notify`=保留 AI 的回复消息。 |
+| `task_message_style` | enum | 否 | 通用任务消息样式：`silent`=**任务轮静默** —— 在给 AI 的指令里要求它「照常调用工具完成任务，需要回应群友时照常回应；只是不要汇报、不要解释、不要提及本次任务」，不需要说话时用框架原生的 `<msg/>`（系统会跳过、不发任何消息）；`notify`=不附加该要求。<br>注：`silent` 是**指令层约定**（v1.4.10 起插件不再拦截消息）——模型若没照做，消息会照常发出；换来的是任何情况下都不会吞消息。 |
 | `auto_publish_group_id` | string | 否 | **后台直接生成模式**：用于获取聊天话题和图片的群号（仅当未配置任何任务目标时生效）。 |
 | `auto_publish_user_id` | string | 否 | **后台直接生成模式**：用于获取聊天话题和图片的个人QQ号（仅当未配置任何任务目标且未配置群号时生效）。 |
 | `auto_publish_image_prob` | float | 否 | 主动发布进入配图候选流程的概率（0-1），默认 1。进入后会把近期图片清单提供给 AI。 |

@@ -1298,7 +1298,7 @@ class QzonePlugin(BasePlugin):
         with_place: bool = True,
         task_extra: Optional[dict] = None,
     ) -> bool:
-        """发送定时任务指令（合成内部事件，带 qzone_task 标记供 silent 模式识别）
+        """发送定时任务指令（合成内部事件，带 qzone_task 标记与配图参数供下游逻辑识别）
 
         with_place=False 用于评论/回复任务：操作对象是空间说说，与会话场合无关，
         附加场合信息反而会误导 AI。
@@ -1327,6 +1327,21 @@ class QzonePlugin(BasePlugin):
                 nickname = await self._get_user_nickname(target_id)
                 place = f"与「{nickname}」{target_id} 的私聊" if nickname else f"与 {target_id} 的私聊"
                 instruction_text += f"\n（当前场合：{place}）"
+
+        # silent 轮次：静默**只在指令层**达成（v1.4.10 起不再拦截任何消息）。
+        #
+        # 框架原生支持"不发送任何消息"：输出 `<msg/>`（提示词 format 段原文：
+        # 「特殊的，你可以输出以下内容实现不发送消息」），解析后 MessageChain 为空、
+        # 框架直接跳过。只要指令说清楚，插件就完全不需要去动消息列表。
+        #
+        # ⚠️ 绝不要在 AFTER_XML_PARSE 钩子里删改 actions —— 那是唯一发送入口，
+        # 解析后没有任何撤回/补发通道，删掉 = 这一轮消息永久丢失（v1.4.9 的故障）。
+        if self.task_message_style == "silent":
+            instruction_text += (
+                "\n（本轮静默执行：**照常调用工具完成任务**，需要回应群友时照常回应；"
+                "只是不要汇报、不要解释、不要提及本次任务 —— 不需要说话时，"
+                "直接输出 <msg/> 即可（这是系统的「不发送消息」标记）。）"
+            )
 
         adapter = self._ada_obj
         adapter_name = adapter.info.name
@@ -1364,18 +1379,6 @@ class QzonePlugin(BasePlugin):
         await self.ctx.message_processor.handle_im_message(event)
         logger.info(f"已向 {sid} 发送指令: {instruction_text[:30]}...")
         return True
-
-    @on.after_xml_parse()
-    async def _silent_task_guard(self, event, actions, *_):
-        """silent 模式下，定时任务指令触发的回复不发送到群里（工具调用不受影响）"""
-        if self.task_message_style != "silent":
-            return
-        for m in getattr(event, "messages", None) or []:
-            extra = getattr(m, "extra", None) or {}
-            if extra.get("qzone_task"):
-                actions.clear()
-                logger.debug("silent 模式：已抑制定时任务指令的群回复")
-                return
 
     # ---------- 带黑名单检查的定时任务 ----------
     async def _auto_publish_job(self):

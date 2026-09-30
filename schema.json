@@ -118,7 +118,7 @@
         "type": "string",
         "enum": ["silent", "notify"],
         "default": "silent",
-        "hint": "定时任务消息样式：silent=发送指令后不保留（无痕），notify=保留消息（通知大家）"
+        "hint": "silent=指令层要求 AI 静默执行、不要汇报；notify=不附加该要求"
     },
     "auto_publish_group_id": {
         "type": "string",
