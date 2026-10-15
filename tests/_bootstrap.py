@@ -367,6 +367,25 @@ class FakeProviderManager:
         return object()
 
 
+class _FakeEventBus:
+    """镜像真框架接线：lifecycle 把 KiraMessageEvent 订阅到处理管线。
+
+    真框架里 `ctx.event_bus.publish(event)` 会路由给 message_processor.handle_event
+    （2.x）/ workflow.handle_event（3.0）；测试里统一委托给当前 ctx.message_processor
+    的 handle_im_message（各用例会把它替换成自己的记录桩）。
+    """
+
+    def __init__(self, ctx):
+        self._ctx = ctx
+
+    async def publish(self, event):
+        mp = self._ctx.message_processor
+        handler = getattr(mp, "handle_im_message", None)
+        if handler is not None:
+            return await handler(event)
+        raise AssertionError("event_bus.publish 被调用，但 message_processor 未就绪")
+
+
 class FakeCtx:
     def __init__(self, adapters=None, data_dir=None):
         self.adapter_mgr = FakeAdapterManager(adapters)
@@ -375,6 +394,7 @@ class FakeCtx:
         self.provider_mgr = FakeProviderManager()
         self.persona_mgr = None
         self.message_processor = None
+        self.event_bus = _FakeEventBus(self)
         self._data_dir = pathlib.Path(data_dir or tempfile.mkdtemp(prefix='qzone_data_'))
 
     def get_plugin_data_dir(self):

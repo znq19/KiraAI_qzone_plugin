@@ -1,3 +1,15 @@
+2026.10.15
+v1.4.12：
+- **适配 KiraAI 3.0 正式版（GA）弃用面**：合成事件发布从
+  `ctx.message_processor.handle_im_message`（GA 已 @deprecated）改走官方路径
+  `ctx.event_bus.publish(event)` —— 两代框架的事件总线都把 KiraMessageEvent
+  订阅到消息处理管线（2.x lifecycle→message_processor.handle_event，
+  3.0 lifecycle→workflow.handle_event），行为不变。
+- 合成事件的 `message_types=` 构造参数（GA 弃用）改为双世代字段探测
+  （3.0=supported_elements，2.x=message_types），适配器元素类型优先走
+  `get_capability(IMCapability)` 元数据（2.x 自动回落旧属性）。
+- 测试骨架补 event_bus 接线（镜像真框架 lifecycle 订阅）。仓内 205 项测试全过（2.x/3.0 GA 双世代）。
+
 2026.10.12
 v1.4.11：
 - **适配 KiraAI 3.0 rc.1**：会话能力接口已全异步化，同步调用会拿到 coroutine 导致

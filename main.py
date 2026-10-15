@@ -18,6 +18,37 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from core.plugin import BasePlugin, register_tool, on, Priority
 from core.chat.message_utils import KiraMessageEvent, KiraMessageBatchEvent
+
+
+# ── 双世代兼容（KiraAI 3.0 GA 弃用面，DEP-2/3）─────────────────────
+# 事件类首字段：2.x = message_types；3.0 = supported_elements（旧名仍收但已弃用）。
+def elements_kw(cls, value):
+    """按当前框架事件类的字段名构造关键字参数（dataclasses 探测，不绑版本号）。"""
+    try:
+        from dataclasses import fields as _dc_fields
+        names = {f.name for f in _dc_fields(cls)}
+    except Exception:
+        names = set()
+    key = "supported_elements" if "supported_elements" in names else "message_types"
+    return {key: value}
+
+
+def adapter_supported_elements(adapter, fallback=None):
+    """双世代取适配器支持的元素类型：3.0 走 IMCapability 元数据；2.x 读 message_types。"""
+    get_cap = getattr(adapter, "get_capability", None)
+    if callable(get_cap):
+        try:
+            from core.adapter.capabilities import IMCapability
+            meta = get_cap(IMCapability).get_message_metadata()
+            els = getattr(meta, "supported_elements", None)
+            if els is not None:
+                return list(els)
+        except Exception:
+            pass
+    els = getattr(adapter, "message_types", None)
+    if els is not None:
+        return list(els)
+    return list(fallback or [])
 from core.chat.message_elements import Image, Text
 from core.chat import MessageChain, KiraIMMessage, User, Group, Session
 from core.prompt_manager import Prompt
@@ -1354,7 +1385,7 @@ class QzonePlugin(BasePlugin):
         t = int(time.time())
         event = KiraMessageEvent(
             adapter=adapter.info,
-            message_types=adapter.message_types,
+            **elements_kw(KiraMessageEvent, adapter_supported_elements(adapter)),
             message=KiraIMMessage(
                 timestamp=t,
                 sender=User(user_id="system_qzone_task", nickname="系统"),
@@ -1380,7 +1411,7 @@ class QzonePlugin(BasePlugin):
                 )
             except Exception as e:
                 logger.debug(f"预取定时任务图片候选失败: {e}")
-        await self.ctx.message_processor.handle_im_message(event)
+        await self.ctx.event_bus.publish(event)
         logger.info(f"已向 {sid} 发送指令: {instruction_text[:30]}...")
         return True
 
