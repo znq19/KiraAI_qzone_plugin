@@ -1,9 +1,15 @@
 {
   "display_name": "QQ空间助手",
   "plugin_id": "qzone_plugin",
-  "version": "1.4.12",
+  "version": "1.4.13",
   "author": "znq19",
   "icon": "icon.png",
+  "locales": {
+    "en": {
+      "display_name": "QZone Assistant",
+      "description": "Full QZone toolkit: post, browse, like, comment, reply, visitor stats, and image-aware posting with recent-chat images."
+    }
+  },
   "tags": [
     "forum",
     "QZone"

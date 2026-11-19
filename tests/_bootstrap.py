@@ -193,6 +193,11 @@ sys.modules['core.plugin'].BasePlugin = BasePlugin
 sys.modules['core.plugin'].register_tool = _ToolRegistry()
 sys.modules['core.plugin'].on = _On()
 sys.modules['core.plugin'].Priority = Priority
+
+import logging as _logging
+
+# 真实框架的 core.plugin 导出一个共享 logger（插件日志统一走它）
+sys.modules['core.plugin'].logger = _logging.getLogger('plugin')
 sys.modules['core.chat'].MessageChain = MessageChain
 sys.modules['core.chat'].KiraIMMessage = KiraIMMessage
 sys.modules['core.chat'].User = User
@@ -204,6 +209,18 @@ sys.modules['core.chat.message_utils'].KiraMessageBatchEvent = KiraMessageBatchE
 sys.modules['core.chat.message_elements'] = _mod('core.chat.message_elements')
 sys.modules['core.chat.message_elements'].Image = Image
 sys.modules['core.chat.message_elements'].Text = Text
+# 3.x 适配器能力接口（真实框架里 get_message_metadata() 是异步的）
+_mod('core.adapter', [])
+_mod('core.adapter.capabilities')
+
+
+class IMCapability:
+    pass
+
+
+sys.modules['core.adapter'].IMCapability = IMCapability
+sys.modules['core.adapter.capabilities'].IMCapability = IMCapability
+
 sys.modules['core.provider'].LLMRequest = LLMRequest
 sys.modules['core.prompt_manager'].Prompt = Prompt
 sys.modules['core.utils.common_utils'].desc_img = desc_img

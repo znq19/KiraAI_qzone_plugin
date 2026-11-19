@@ -58,7 +58,7 @@ class TestFetchPolicy(unittest.TestCase):
     def test_failure_log_deduped(self):
         """同一 URL 连续失败：只打一条可见日志，其余降级 debug。"""
         B.patch_shared_session([B.FakeResponse(400)] * 4)
-        with self.assertLogs(utils.__name__, level='DEBUG') as ctx:
+        with self.assertLogs(utils.logger, level='DEBUG') as ctx:
             B.run(utils.fetch_bytes("https://x/same.jpg"))
             B.run(utils.fetch_bytes("https://x/same.jpg"))
             B.run(utils.fetch_bytes("https://x/same.jpg"))
@@ -68,7 +68,7 @@ class TestFetchPolicy(unittest.TestCase):
 
     def test_different_urls_logged_separately(self):
         B.patch_shared_session([B.FakeResponse(400)] * 4)
-        with self.assertLogs(utils.__name__, level='DEBUG') as ctx:
+        with self.assertLogs(utils.logger, level='DEBUG') as ctx:
             B.run(utils.fetch_bytes("https://x/a.jpg"))
             B.run(utils.fetch_bytes("https://x/b.jpg"))
         visible = [r for r in ctx.records if r.levelno >= logging.INFO]

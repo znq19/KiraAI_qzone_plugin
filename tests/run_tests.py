@@ -31,6 +31,7 @@ MODULES = [
     'test_lifecycle',
     'test_review_fixes',
     'test_silent_guard',
+    'test_text_guard',
 ]
 
 
