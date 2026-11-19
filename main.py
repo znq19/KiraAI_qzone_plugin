@@ -33,13 +33,21 @@ def elements_kw(cls, value):
     return {key: value}
 
 
-def adapter_supported_elements(adapter, fallback=None):
-    """双世代取适配器支持的元素类型：3.0 走 IMCapability 元数据；2.x 读 message_types。"""
+async def adapter_supported_elements(adapter, fallback=None):
+    """双世代取适配器支持的元素类型：3.x 走 IMCapability 元数据；2.x 读 message_types。
+
+    注意：3.x 的 `get_message_metadata()` 是**异步**的（2.x 无此能力接口）。
+    旧实现同步调用只会拿到 coroutine —— 既探测不到元素类型（退化成读取已弃用的
+    `message_types` 并触发弃用告警），又留下一条 "coroutine was never awaited"。
+    这里 await 掉，两个世代都能拿到正确结果。
+    """
     get_cap = getattr(adapter, "get_capability", None)
     if callable(get_cap):
         try:
             from core.adapter.capabilities import IMCapability
             meta = get_cap(IMCapability).get_message_metadata()
+            if inspect.isawaitable(meta):
+                meta = await meta
             els = getattr(meta, "supported_elements", None)
             if els is not None:
                 return list(els)
@@ -72,13 +80,17 @@ from .qzone.image_policy import (
 )
 from .qzone.parser import QzoneParser
 from .qzone.model import Post as QzonePost, Comment as QzoneComment
+from .qzone.text_guard import sanitize_text
 
 try:
     from core.utils.common_utils import desc_img
 except Exception:  # 核心路径变更时不影响插件加载
     desc_img = None
 
-logger = logging.getLogger(__name__)
+try:  # KiraAI 规范：插件日志并入框架统一管线（控制台 / 文件 / WebUI）
+    from core.plugin import logger
+except Exception:  # 单元测试桩等极简环境
+    logger = logging.getLogger(__name__)
 
 
 def _read_head_bytes(path, size: int = 16) -> bytes:
@@ -1385,7 +1397,7 @@ class QzonePlugin(BasePlugin):
         t = int(time.time())
         event = KiraMessageEvent(
             adapter=adapter.info,
-            **elements_kw(KiraMessageEvent, adapter_supported_elements(adapter)),
+            **elements_kw(KiraMessageEvent, await adapter_supported_elements(adapter)),
             message=KiraIMMessage(
                 timestamp=t,
                 sender=User(user_id="system_qzone_task", nickname="系统"),
@@ -1553,6 +1565,7 @@ class QzonePlugin(BasePlugin):
         else:
             text = await self._call_llm(prompt, system_prompt, use_backend_model=True)
 
+        text = self._sanitize_outgoing_text(text, "说说正文")
         if not text:
             logger.warning("LLM生成内容为空，跳过自动发布")
             return
@@ -1676,6 +1689,7 @@ class QzonePlugin(BasePlugin):
                     _, prompt_content = self._parse_comment_content(comment.content)
                     prompt = f"用户 {comment.nickname} 评论了你的说说：{prompt_content}，请生成一条简洁回复（0-15字）。"
                     reply_text = await self._call_llm(prompt, await self._get_persona_content(), use_backend_model=True)
+                    reply_text = self._sanitize_outgoing_text(reply_text, "回复内容")
                     if not reply_text:
                         continue
                     root_comment = self._find_root_comment(full_post.comments, comment)
@@ -2475,7 +2489,32 @@ class QzonePlugin(BasePlugin):
         self._prune_dedupe_history()
         self._save_state()
 
+    @staticmethod
+    def _sanitize_outgoing_text(text: str, kind: str = "正文") -> str:
+        """清理误写进正文的协议标签（说说/评论/回复共用同一套规则）。
+
+        只认 <msg>/<text>/<image_indices> 等协议标签，普通尖括号文案不动；
+        详见 qzone/text_guard.py。
+        """
+        guarded = sanitize_text(text)
+        if guarded.changed:
+            logger.info(
+                "%s已清理协议标签: %s（%d → %d 字）",
+                kind,
+                ",".join(guarded.reasons) or "-",
+                len(str(text or "")),
+                len(guarded.text),
+            )
+        return guarded.text
+
     async def _publish(self, text: str, image_urls: list, allow_image_drop: bool = False) -> str:
+        # 最后一道闸：所有发布路径（工具 / 旧后台 / 定时）都经过这里。
+        # 工具层已清过一次，这里幂等兜底——任何调用方都漏不出去。
+        text = self._sanitize_outgoing_text(text, "说说正文")
+        if not text.strip() and not image_urls:
+            # 纯标签/空正文且没有配图：拒绝发空说说。
+            # 有配图时保持历史行为（允许只发图），不因护栏造成功能丢失。
+            raise RuntimeError("说说正文为空，已取消发布")
         await self._ensure_api()
         post = QzonePost(text=text, images=image_urls)
         resp = await self.api.publish(post, allow_image_drop=allow_image_drop)
@@ -2605,6 +2644,9 @@ class QzonePlugin(BasePlugin):
         await self._ensure_api()
         if not self.my_uin:
             raise RuntimeError("无法确认当前登录 QQ，已取消评论")
+        content = self._sanitize_outgoing_text(content, "评论内容")
+        if not content.strip():
+            raise RuntimeError("评论内容为空，已取消")
 
         # 幂等检查：本地遍历评论比对（不调 LLM，不消耗 token）
         try:
@@ -2677,6 +2719,9 @@ class QzonePlugin(BasePlugin):
             content = await self._call_llm(prompt, await self._get_persona_content(), use_backend_model=False)
             if not content:
                 raise RuntimeError("生成回复内容为空")
+        content = self._sanitize_outgoing_text(content, "回复内容")
+        if not content.strip():
+            raise RuntimeError("回复内容为空")
         resp = await self.api.reply(post, comment, content, root_comment=root_comment)
         if not resp.ok:
             raise RuntimeError(f"回复失败: {resp.message}")
@@ -2861,6 +2906,41 @@ class QzonePlugin(BasePlugin):
             task_maximum = task_policy[1] if task_policy else None
             images = images or []
             image_indices = image_indices or []
+
+            # 模型偶尔会把框架的回复格式或工具参数伪 XML 写进 text
+            # （例如「正文</text>\n<image_indices" string="false">[1, 2, 3]」）。
+            # 在解析参数之前清理，并把误写的 image_indices/images 捡回来：
+            # 正文干净，配图也不丢（见 qzone/text_guard.py）。
+            raw_text = text
+            guarded = sanitize_text(text)
+            if guarded.changed:
+                logger.info(
+                    "qzone_publish 正文已清理协议标签: %s（%d → %d 字）",
+                    ",".join(guarded.reasons) or "-",
+                    len(str(text or "")),
+                    len(guarded.text),
+                )
+            text = guarded.text
+            if not text.strip() and str(raw_text or "").strip():
+                return (
+                    "说说正文为空：模型输出里只有 <msg>/<text> 等协议标签，已取消发布。"
+                    "请把要说的话放进 text 参数（纯文本）后重试。"
+                )
+            # 捡回来的参数只是"尽力而为"：解析不到就按没写处理，绝不因为
+            # 模型的一处误写把整条说说卡死（显式传参仍走原来的严格报错）。
+            recovered_indices = False
+            recovered_images = False
+            if not image_indices and guarded.image_indices:
+                image_indices = guarded.image_indices
+                recovered_indices = True
+                logger.info("已从正文误写的标签中恢复 image_indices=%s", image_indices)
+            if not images and guarded.images:
+                images = guarded.images
+                recovered_images = True
+                logger.info("已从正文误写的标签中恢复 images=%s", images)
+            if guarded.want_images and not image_indices and not images:
+                want_images = True
+
             valid_sources = []
             for item in images:
                 if not isinstance(item, str) or not item.strip():
@@ -2877,7 +2957,13 @@ class QzonePlugin(BasePlugin):
                     event.sid, image_indices, apply_dedupe=task_policy is not None
                 )
                 if not resolved:
-                    if task_target is None:
+                    if recovered_indices and task_target is None:
+                        # 从正文标签里捡回来的序号不可用：当作没写，正文照发。
+                        logger.warning(
+                            "正文恢复的 image_indices=%s 无法解析，已忽略并继续发布", image_indices
+                        )
+                        image_indices = []
+                    elif task_target is None:
                         return (
                             f"未能从[近期图片]清单解析出图片（当前会话清单为空，或序号 {image_indices} 超出范围），说说未发布。"
                             "如想配图，可先传 want_images=true 取一份候选清单（本次不会发布），再带 image_indices 调用一次；"
@@ -2891,7 +2977,10 @@ class QzonePlugin(BasePlugin):
                     )
                 valid_sources.extend(resolved)
             elif images and not valid_sources:
-                return "images 参数中的地址均无效，说说未发布。请传有效的图片 URL 或本地路径。"
+                if recovered_images:
+                    logger.warning("正文恢复的 images=%s 全部无效，已忽略并继续发布", images)
+                else:
+                    return "images 参数中的地址均无效，说说未发布。请传有效的图片 URL 或本地路径。"
             if images:
                 # 显式传来的图片地址：只要是本插件登记过的（带 message_id），
                 # 就顺手用 get_msg 续命一次，避免拿过期链接去发布而失败

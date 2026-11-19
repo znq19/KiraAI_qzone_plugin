@@ -5,7 +5,10 @@ import logging
 
 from .model import QzoneContext
 
-logger = logging.getLogger(__name__)
+try:  # KiraAI 规范：插件日志并入框架统一管线（控制台 / 文件 / WebUI）
+    from core.plugin import logger
+except Exception:  # 单元测试桩等极简环境
+    logger = logging.getLogger(__name__)
 
 
 class QzoneSession:

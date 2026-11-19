@@ -61,3 +61,33 @@ class TestStartup(B.LoopTestCase):
         plugin.scheduler = None
         self.run_(plugin._setup_scheduled_jobs())   # 不应抛异常
         self.run_(plugin.terminate())
+
+
+class AsyncMetaAdapter(B.FakeAdapter):
+    """模拟 3.x 适配器：get_message_metadata() 是异步的。"""
+
+    def get_capability(self, cls):
+        class Cap:
+            async def get_message_metadata(self):
+                return B._Simple(supported_elements=["text", "img", "face"])
+        return Cap()
+
+
+class TestAdapterProbe(B.LoopTestCase):
+    def test_async_metadata_is_awaited(self):
+        """3.x 的元数据接口是协程：必须 await，否则退化为弃用的 message_types。"""
+        plugin, _ = B.make_plugin(adapters={"qq_ada": AsyncMetaAdapter("qq_ada")})
+        els = self.run_(B.main.adapter_supported_elements(plugin._resolve_ada()))
+        self.assertEqual(els, ["text", "img", "face"])
+
+    def test_synthetic_task_event_carries_elements(self):
+        plugin, ctx = B.make_plugin(adapters={"qq_ada": AsyncMetaAdapter("qq_ada")})
+        plugin.task_group_ids = ["123"]
+        captured = []
+
+        async def publish(ev):
+            captured.append(ev)
+
+        ctx.event_bus.publish = publish
+        self.assertTrue(self.run_(plugin._send_task_instruction("hello")))
+        self.assertEqual(list(captured[0].message_types), ["text", "img", "face"])
