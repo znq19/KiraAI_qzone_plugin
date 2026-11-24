@@ -1,3 +1,17 @@
+2026.11.24
+v1.4.14：
+- **修复「自动获取 Cookie 一直超时、重载也没用」**。实测与代码比对确认：这不是 KiraAI 3.3.0
+  的兼容性问题（3.3.0 对 QQ 适配器只加了群名片字段，`NapCatWebSocketClient.send_action()`
+  从 v2.34.8 到 v3.3.0 逐字未变）。失败发生在 OneBot 实现侧：`get_cookies` 需要先
+  `forceFetchClientKey()`（QQNT 原生 IPC），再对 `ssl.ptlogin2.qq.com` 发起 HTTPS 跳转
+  （NapCat / LLOneBot / SnowLuma 的实现都没有超时）；网络抖动时远超插件原来的 5s。
+- 新增 `cookie_fetch_timeout`（默认 `25s`），**只作用于 get_cookies**；
+  `onebot_action_timeout`（默认 `5s`）继续管其它 OneBot 动作。
+- 软重置逻辑保持 v1.4.13 原样：无条件丢弃旧会话、重新获取最新 Cookie。
+  本次只放宽 get_cookies 的超时，不引入任何健康检查/会话保留分支——拿不到最新
+  Cookie 时宁可暂时不可用，也不拿旧 Cookie 顶着。
+- 新增回归测试（独立超时接线、README 卫生守卫）；仓内测试全过。
+
 2026.11.19
 v1.4.13：
 - **修复说说正文漏出协议标签（重要）**。实机日志里模型把「框架回复格式 + 工具参数伪 XML」

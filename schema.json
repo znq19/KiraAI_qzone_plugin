@@ -57,7 +57,12 @@
     "onebot_action_timeout": {
         "type": "string",
         "default": "5s",
-        "hint": "调用 OneBot 动作（如获取 Cookie、取消息）的超时时间，如 '5s'、'10s'。调小可以更快失败并转入后台重试。"
+        "hint": "调用 OneBot 动作（取消息、查资料等）的超时时间，如 '5s'、'10s'。获取 Cookie 不在此列，见 cookie_fetch_timeout。"
+    },
+    "cookie_fetch_timeout": {
+        "type": "string",
+        "default": "25s",
+        "hint": "获取 Cookie 的专用超时，默认 25s。get_cookies 需要先取 clientKey 再访问 ssl.ptlogin2.qq.com（实现侧无超时），网络抖动时 5s 会误判失败；只影响 get_cookies，不影响其它 OneBot 调用。"
     },
     "master_ids": {
         "type": "string",
