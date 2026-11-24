@@ -255,6 +255,13 @@ class QzonePlugin(BasePlugin):
         self.onebot_action_timeout = self._parse_interval_seconds(
             cfg.get("onebot_action_timeout", "5s"), default_unit="s"
         ) or 5
+        # 获取 Cookie 专用超时：NapCat/LLOneBot/SnowLuma 的 get_cookies 不是纯内存读取，
+        # 而是 forceFetchClientKey()（QQNT 原生 IPC）+ 对 ssl.ptlogin2.qq.com 的
+        # HTTPS 跳转（可能多级 302，且实现侧没有超时）。网络抖动时 5s 必然误杀，
+        # 所以单独给一个更宽松的超时，且只作用于 get_cookies。
+        self.cookie_fetch_timeout = self._parse_interval_seconds(
+            cfg.get("cookie_fetch_timeout", "25s"), default_unit="s"
+        ) or 25
         # Cookie 连接自愈
         self.cookie_self_heal = bool(cfg.get("cookie_self_heal", True))
         self.cookie_self_heal_threshold = max(1, int(cfg.get("cookie_self_heal_threshold", 3) or 3))
@@ -1114,10 +1121,10 @@ class QzonePlugin(BasePlugin):
 
     async def _get_cookie_from_onebot(self) -> Optional[str]:
         try:
-            # send_action 默认超时 10s；Cookie 刷新属"锦上添花"，给 5s 快速失败，
-            # 避免 OneBot 繁忙时把整条发布/评论链路拖死。
+            # get_cookies 是 OneBot 实现里唯一会做外部 HTTPS 的动作（见 cookie_fetch_timeout），
+            # 用独立超时；它只在后台刷新/启动重试里跑，不会拖慢前台发布/评论链路。
             data = await self._call_onebot_action(
-                "get_cookies", {"domain": "user.qzone.qq.com"}, timeout=self.onebot_action_timeout
+                "get_cookies", {"domain": "user.qzone.qq.com"}, timeout=self.cookie_fetch_timeout
             )
             if data.get("status") != "ok":
                 logger.debug(f"oneBot 返回错误: {str(data)[:200]}")

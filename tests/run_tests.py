@@ -32,6 +32,7 @@ MODULES = [
     'test_review_fixes',
     'test_silent_guard',
     'test_text_guard',
+    'test_readme_hygiene',
 ]
 
 

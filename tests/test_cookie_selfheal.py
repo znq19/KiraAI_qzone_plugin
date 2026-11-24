@@ -199,3 +199,34 @@ class TestAdapterRestart(B.LoopTestCase):
         self.run_(trigger())
         # 默认关闭：适配器实例不变
         self.assertIn('qq_ada', self.ctx.adapter_mgr.get_adapters())
+
+class TestCookieFetchTimeout(B.LoopTestCase):
+    """get_cookies 使用独立超时，绝不再被 5s 的通用动作超时误杀。"""
+
+    def test_default_is_25s(self):
+        plugin, _ = B.make_plugin(cfg={'cookie_self_heal': False})
+        self.assertEqual(plugin.cookie_fetch_timeout, 25)
+        self.assertEqual(plugin.onebot_action_timeout, 5)
+
+    def test_override(self):
+        plugin, _ = B.make_plugin(
+            cfg={'cookie_self_heal': False, 'cookie_fetch_timeout': '40s'}
+        )
+        self.assertEqual(plugin.cookie_fetch_timeout, 40)
+
+    def test_get_cookies_uses_dedicated_timeout(self):
+        plugin, _ = B.make_plugin(
+            cfg={'cookie_self_heal': False, 'cookie_fetch_timeout': '40s'}
+        )
+        seen = {}
+
+        async def fake_call(action, params, timeout=None):
+            seen['action'] = action
+            seen['timeout'] = timeout
+            return {'status': 'ok', 'data': {'cookies': 'uin=o10001; skey=abc; p_skey=def'}}
+
+        plugin._call_onebot_action = fake_call
+        got = self.run_(plugin._get_cookie_from_onebot())
+        self.assertEqual(got, 'uin=o10001; skey=abc; p_skey=def')
+        self.assertEqual(seen['action'], 'get_cookies')
+        self.assertEqual(seen['timeout'], 40)
